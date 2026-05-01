@@ -1,6 +1,6 @@
 import { Link } from "react-router-dom";
 import type { EventItem } from "../types";
-import { formatEventDate, eventCategory, isSoldOut, minPriceEtb } from "../lib/eventUtils";
+import { formatEventDate, eventCategory, eventCoverImageUrl, isSoldOut, minPriceEtb } from "../lib/eventUtils";
 
 type Props = {
   event: EventItem;
@@ -17,11 +17,7 @@ export function EventCard({ event, featured }: Props) {
     <article className={`pzm-card ${featured ? "pzm-card--featured" : ""}`}>
       <Link to={`/event/${event.id}`} className="pzm-card__mediaLink">
         <div className="pzm-card__media">
-          {event.eventImageUrl ? (
-            <img src={event.eventImageUrl} alt={event.name} className="pzm-card__img" />
-          ) : (
-            <div className="pzm-card__placeholder" aria-hidden />
-          )}
+          <img src={eventCoverImageUrl(event)} alt={event.name} className="pzm-card__img" loading="lazy" />
           <span className="pzm-card__badge">{category}</span>
           {soldOut ? <span className="pzm-card__soldOut">Sold Out</span> : null}
         </div>

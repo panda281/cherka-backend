@@ -9,7 +9,9 @@
     "start": "node dist/server.js",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "test": "echo \"No tests yet\""
+    "test": "echo \"No tests yet\"",
+    "install:all": "npm install && npm install --prefix frontend",
+    "sync:locks": "npm install --package-lock-only && npm install --package-lock-only --prefix frontend"
   },
   "keywords": [],
   "author": "",

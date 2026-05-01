@@ -2,10 +2,12 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { EventCard } from "../components/EventCard";
 import { requestEvents } from "../lib/api";
+import { DEFAULT_HERO_UNSPLASH } from "../lib/unsplashPlaceholders";
 import {
   formatEventDate,
   formatEventTimeRange,
   eventCategory,
+  eventCoverImageUrl,
   isSoldOut,
   minPriceEtb,
   publishedEvents
@@ -149,9 +151,12 @@ export function HomePage() {
         {featured ? (
           <>
             <div className="pzm-hero__bg">
-              {featured.eventImageUrl ? (
-                <img src={featured.eventImageUrl} alt={featured.name} className="pzm-hero__bgImg" />
-              ) : null}
+              <img
+                src={eventCoverImageUrl(featured)}
+                alt={featured.name}
+                className="pzm-hero__bgImg"
+                fetchPriority="high"
+              />
               <div className="pzm-hero__scrim" />
             </div>
             <div className="pzm-hero__content">
@@ -185,11 +190,17 @@ export function HomePage() {
             </div>
           </>
         ) : (
-          <div className="pzm-hero__content pzm-hero__content--empty">
-            <span className="pzm-hero__eyebrow">Events</span>
-            <h1 className="pzm-hero__title">No published events yet</h1>
-            <p className="pzm-hero__desc">Check back soon for new experiences.</p>
-          </div>
+          <>
+            <div className="pzm-hero__bg">
+              <img src={DEFAULT_HERO_UNSPLASH} alt="" className="pzm-hero__bgImg" fetchPriority="high" />
+              <div className="pzm-hero__scrim" />
+            </div>
+            <div className="pzm-hero__content pzm-hero__content--empty">
+              <span className="pzm-hero__eyebrow">Events</span>
+              <h1 className="pzm-hero__title">No published events yet</h1>
+              <p className="pzm-hero__desc">Check back soon for new experiences.</p>
+            </div>
+          </>
         )}
       </section>
 

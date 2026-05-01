@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
+import { requestEvents } from "../lib/api";
 import {
   formatEventDate,
   formatEventTimeRange,
   eventCategory,
+  eventCoverImageUrl,
   isSoldOut,
   minPriceEtb,
   publishedEvents
@@ -30,9 +32,7 @@ export function EventDetailPage() {
     (async () => {
       setLoading(true);
       try {
-        const response = await fetch(`${apiBaseUrl}/events`);
-        if (!response.ok) throw new Error("Failed to load events.");
-        const payload = (await response.json()) as EventItem[];
+        const payload = await requestEvents(apiBaseUrl);
         if (!cancelled) {
           setEvents(payload);
           setSelectedTierId("");
@@ -133,11 +133,7 @@ export function EventDetailPage() {
   return (
     <main className="pzm-detail">
       <div className="pzm-detail__hero">
-        {event.eventImageUrl ? (
-          <img src={event.eventImageUrl} alt={event.name} className="pzm-detail__heroImg" />
-        ) : (
-          <div className="pzm-detail__heroPlaceholder" />
-        )}
+        <img src={eventCoverImageUrl(event)} alt={event.name} className="pzm-detail__heroImg" fetchPriority="high" />
         <div className="pzm-detail__heroScrim" />
       </div>
 

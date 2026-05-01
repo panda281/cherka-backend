@@ -1,4 +1,5 @@
 import type { EventItem } from "../types";
+import { unsplashCoverForEventId } from "./unsplashPlaceholders";
 
 export function inferCategory(name: string): string {
   const n = name.toLowerCase();
@@ -50,4 +51,21 @@ export function formatEventTimeRange(startIso: string, endIso: string): string {
   const s = new Date(startIso).toLocaleTimeString(undefined, opts);
   const e = new Date(endIso).toLocaleTimeString(undefined, opts);
   return `${s} – ${e}`;
+}
+
+function isUsableRemoteImageUrl(u: string | null | undefined): u is string {
+  if (u == null) return false;
+  const t = u.trim();
+  if (!t) return false;
+  if (/^(null|undefined)$/i.test(t)) return false;
+  return /^https?:\/\//i.test(t);
+}
+
+/** Custom image when set and valid; otherwise a stable Unsplash cover per event id. */
+export function eventCoverImageUrl(event: EventItem): string {
+  if (isUsableRemoteImageUrl(event.eventImageUrl)) {
+    return event.eventImageUrl.trim();
+  }
+  const id = event.id?.trim() || "default";
+  return unsplashCoverForEventId(id);
 }
