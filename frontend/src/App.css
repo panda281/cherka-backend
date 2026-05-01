@@ -1,0 +1,209 @@
+.container {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 28px 16px 56px;
+  display: grid;
+  gap: 20px;
+}
+
+.hero {
+  background: linear-gradient(135deg, #111827 0%, #312e81 100%);
+  color: #f9fafb;
+  border-radius: 16px;
+  padding: 24px;
+}
+
+.topNav {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+.topNav .brand {
+  font-weight: 700;
+}
+
+.topNav a {
+  color: #c7d2fe;
+  text-decoration: none;
+}
+
+.heroContent {
+  display: grid;
+  grid-template-columns: 1.5fr 1fr;
+  gap: 16px;
+}
+
+.hero h1 {
+  margin: 0 0 8px;
+  font-size: 2rem;
+  line-height: 1.2;
+}
+
+.hero p {
+  margin: 0;
+  color: #e5e7eb;
+}
+
+.heroActions {
+  margin-top: 16px;
+  display: flex;
+  gap: 10px;
+}
+
+.heroStat {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 12px;
+  padding: 14px;
+}
+
+.heroStat h3 {
+  margin-top: 0;
+}
+
+.heroStat ul {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 6px;
+}
+
+.card {
+  border: 1px solid #e2e8f0;
+  border-radius: 16px;
+  padding: 20px;
+  background: #ffffff;
+}
+
+.card h2 {
+  margin: 0 0 10px;
+  font-size: 1.25rem;
+}
+
+.card {
+  display: grid;
+  gap: 10px;
+}
+
+button {
+  font-size: 0.95rem;
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid #cbd5e1;
+}
+
+button {
+  width: fit-content;
+  background: #1d4ed8;
+  color: #ffffff;
+  cursor: pointer;
+  border: none;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.sectionTitle p {
+  margin: 0;
+  color: #475569;
+}
+
+.featureGrid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.featureGrid article {
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 14px;
+  background: #f8fafc;
+}
+
+.eventCards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.eventCard {
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 12px;
+  background: #f8fafc;
+}
+
+.eventCard h3 {
+  margin: 0 0 4px;
+}
+
+.eventCard p {
+  margin: 0 0 10px;
+  color: #475569;
+}
+
+.tierWrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.tierTag {
+  background: #dbeafe;
+  color: #1e3a8a;
+  font-size: 0.8rem;
+  padding: 4px 8px;
+  border-radius: 999px;
+}
+
+.cta {
+  text-align: center;
+  justify-items: center;
+}
+
+.empty {
+  color: #64748b;
+}
+
+.primaryBtn,
+.secondaryBtn {
+  display: inline-block;
+  border-radius: 8px;
+  text-decoration: none;
+  font-weight: 600;
+  padding: 10px 14px;
+}
+
+.primaryBtn {
+  background: #1d4ed8;
+  color: #fff;
+}
+
+.secondaryBtn {
+  border: 1px solid #c7d2fe;
+  color: #c7d2fe;
+}
+
+.message {
+  border-radius: 10px;
+  border: 1px solid #fca5a5;
+  background: #fef2f2;
+  color: #991b1b;
+  padding: 12px;
+}
+
+@media (max-width: 860px) {
+  .heroContent,
+  .featureGrid,
+  .eventCards {
+    grid-template-columns: 1fr;
+  }
+
+  .hero h1 {
+    font-size: 1.6rem;
+  }
+}
