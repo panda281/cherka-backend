@@ -2,9 +2,12 @@ import express from "express";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { Markup, Telegraf } from "telegraf";
 import { config } from "../../config";
+import { DEFAULT_EVENT_CATEGORY, EVENT_CATEGORIES, parseEventCategory } from "../../constants/eventCategories";
 import { db } from "../../db/client";
 import { eventTiers, events, orders, receiptSubmissions, tickets } from "../../db/schema";
 import { buildReceiptUrl } from "../../utils";
+import { approveReceiptSubmission } from "../receipts/approveSubmission";
+import { resolveReceiptVerification } from "../receipts/verifier";
 import { issueTicketForApprovedOrder } from "../tickets/service";
 
 export const telegramRouter = express.Router();
@@ -52,6 +55,7 @@ type AdminCreateState = {
     | "endsAt"
     | "location"
     | "description"
+    | "category"
     | "eventImageUrl"
     | "ticketTemplateImageUrl"
     | "tierAsk"
@@ -65,6 +69,7 @@ type AdminCreateState = {
   endsAt?: string;
   location?: string;
   description?: string;
+  category?: string;
   eventImageUrl?: string;
   ticketTemplateImageUrl?: string;
   tiers: TierDraft[];
@@ -80,7 +85,16 @@ type AdminTierAddState = {
 type AdminEditState = {
   eventId: string;
   step: "value";
-  field: "name" | "startsAt" | "endsAt" | "location" | "description" | "status" | "eventImageUrl" | "ticketTemplateImageUrl";
+  field:
+    | "name"
+    | "startsAt"
+    | "endsAt"
+    | "location"
+    | "description"
+    | "category"
+    | "status"
+    | "eventImageUrl"
+    | "ticketTemplateImageUrl";
 };
 type AdminTierEditState = {
   eventId: string;
@@ -135,7 +149,7 @@ if (config.telegramAdminBotToken) {
 
     await adminBot!.telegram.sendMessage(
       chatId,
-      `Event: ${eventItem.name}\nStatus: ${eventItem.status}\nStart: ${eventItem.startsAt.toISOString()}\nEnd: ${eventItem.endsAt.toISOString()}\nLocation: ${eventItem.location ?? "-"}\nEvent image: ${eventItem.eventImageUrl ?? "-"}\nTicket template image: ${eventItem.ticketTemplateImageUrl ?? "-"}\n\nTiers:\n${tiersText}`,
+      `Event: ${eventItem.name}\nCategory: ${eventItem.category}\nStatus: ${eventItem.status}\nStart: ${eventItem.startsAt.toISOString()}\nEnd: ${eventItem.endsAt.toISOString()}\nLocation: ${eventItem.location ?? "-"}\nEvent image: ${eventItem.eventImageUrl ?? "-"}\nTicket template image: ${eventItem.ticketTemplateImageUrl ?? "-"}\n\nTiers:\n${tiersText}`,
       Markup.inlineKeyboard([
         [Markup.button.callback("Add Tier", `admin_event_add_tier:${eventId}`), Markup.button.callback("Edit Event", `admin_event_edit:${eventId}`)],
         ...tierButtons,
@@ -174,7 +188,7 @@ if (config.telegramAdminBotToken) {
     }
     await ctx.answerCbQuery();
     adminCreateState.set(String(ctx.from.id), { mode: "create", step: "name", tiers: [] });
-    await ctx.reply("Creating new event.\nStep 1/10: send event name.");
+    await ctx.reply("Creating new event.\nStep 1/11: send event name.");
   });
 
   adminBot.action("admin_event_list", async (ctx) => {
@@ -284,8 +298,8 @@ if (config.telegramAdminBotToken) {
       Markup.inlineKeyboard([
         [Markup.button.callback("Name", `admin_edit_field:${eventId}:name`), Markup.button.callback("Start Date", `admin_edit_field:${eventId}:startsAt`)],
         [Markup.button.callback("End Date", `admin_edit_field:${eventId}:endsAt`), Markup.button.callback("Location", `admin_edit_field:${eventId}:location`)],
-        [Markup.button.callback("Description", `admin_edit_field:${eventId}:description`), Markup.button.callback("Status", `admin_edit_field:${eventId}:status`)],
-        [Markup.button.callback("Event Image URL", `admin_edit_field:${eventId}:eventImageUrl`)],
+        [Markup.button.callback("Description", `admin_edit_field:${eventId}:description`), Markup.button.callback("Category", `admin_edit_field:${eventId}:category`)],
+        [Markup.button.callback("Status", `admin_edit_field:${eventId}:status`), Markup.button.callback("Event Image URL", `admin_edit_field:${eventId}:eventImageUrl`)],
         [Markup.button.callback("Ticket Template URL", `admin_edit_field:${eventId}:ticketTemplateImageUrl`)],
         [Markup.button.callback("Done", `admin_edit_done:${eventId}`)]
       ])
@@ -342,7 +356,7 @@ if (config.telegramAdminBotToken) {
     }
     await ctx.answerCbQuery();
     await ctx.reply(
-      "Commands:\n/adminmenu\n/newevent name|startsAtISO|endsAtISO|location|description\n/addtier eventId|tierCode|tierName|price|capacity(optional)\n/eventlist\n/verifyqueue\n/approve receiptId\n/reject receiptId reason"
+      "Commands:\n/adminmenu\n/newevent name|startsAtISO|endsAtISO|location|description|category(optional)\n/addtier eventId|tierCode|tierName|price|capacity(optional)\n/eventlist\n/verifyqueue\n/approve receiptId\n/reject receiptId reason"
     );
   });
 
@@ -371,10 +385,21 @@ if (config.telegramAdminBotToken) {
       return;
     }
     const payload = getText(ctx).replace("/newevent", "").trim();
-    const [name, startsAt, endsAt, location, description] = payload.split("|").map((item) => item.trim());
+    const [name, startsAt, endsAt, location, description, categoryRaw] = payload.split("|").map((item) => item.trim());
     if (!name || !startsAt || !endsAt) {
-      await ctx.reply("Usage: /newevent name|startsAtISO|endsAtISO|location|description");
+      await ctx.reply(
+        "Usage: /newevent name|startsAtISO|endsAtISO|location|description|category(optional)\nCategory: Music, Festivals, Arts, Exhibitions, Sports, Tech"
+      );
       return;
+    }
+    let finalCategory = DEFAULT_EVENT_CATEGORY;
+    if (categoryRaw) {
+      const parsed = parseEventCategory(categoryRaw);
+      if (!parsed) {
+        await ctx.reply(`Invalid category. Use: ${EVENT_CATEGORIES.join(", ")}`);
+        return;
+      }
+      finalCategory = parsed;
     }
     const [created] = await db
       .insert(events)
@@ -384,6 +409,7 @@ if (config.telegramAdminBotToken) {
         endsAt: new Date(endsAt),
         location,
         description,
+        category: finalCategory,
         status: "published"
       })
       .returning();
@@ -573,6 +599,21 @@ if (config.telegramAdminBotToken) {
     }
 
     if (editState) {
+      if (editState.field === "category") {
+        const cat = parseEventCategory(text);
+        if (!cat) {
+          await ctx.reply(`Invalid category. Send one of: ${EVENT_CATEGORIES.join(", ")}`);
+          return;
+        }
+        await db
+          .update(events)
+          .set({ category: cat, updatedAt: new Date() })
+          .where(eq(events.id, editState.eventId));
+        adminEditState.delete(String(ctx.from.id));
+        await ctx.reply("Event updated.");
+        await sendEventDetail(ctx.chat!.id, editState.eventId);
+        return;
+      }
       const value =
         editState.field === "eventImageUrl" || editState.field === "ticketTemplateImageUrl"
           ? text.toLowerCase() === "skip"
@@ -644,7 +685,7 @@ if (config.telegramAdminBotToken) {
     if (state.step === "name") {
       state.name = text;
       state.step = "startsAt";
-      await ctx.reply("Step 2/10: send start date in ISO format (example 2026-12-31T17:00:00Z).");
+      await ctx.reply("Step 2/11: send start date in ISO format (example 2026-12-31T17:00:00Z).");
       return;
     }
     if (state.step === "startsAt") {
@@ -654,7 +695,7 @@ if (config.telegramAdminBotToken) {
       }
       state.startsAt = text;
       state.step = "endsAt";
-      await ctx.reply("Step 3/10: send end date in ISO format.");
+      await ctx.reply("Step 3/11: send end date in ISO format.");
       return;
     }
     if (state.step === "endsAt") {
@@ -664,31 +705,44 @@ if (config.telegramAdminBotToken) {
       }
       state.endsAt = text;
       state.step = "location";
-      await ctx.reply("Step 4/10: send location.");
+      await ctx.reply("Step 4/11: send location.");
       return;
     }
     if (state.step === "location") {
       state.location = text;
       state.step = "description";
-      await ctx.reply("Step 5/10: send description.");
+      await ctx.reply("Step 5/11: send description.");
       return;
     }
     if (state.step === "description") {
       state.description = text;
+      state.step = "category";
+      await ctx.reply(
+        `Step 6/11: send category. One of: ${EVENT_CATEGORIES.join(", ")} (default if unsure: Music).`
+      );
+      return;
+    }
+    if (state.step === "category") {
+      const cat = parseEventCategory(text);
+      if (!cat) {
+        await ctx.reply(`Invalid category. Send one of: ${EVENT_CATEGORIES.join(", ")}`);
+        return;
+      }
+      state.category = cat;
       state.step = "eventImageUrl";
-      await ctx.reply("Step 6/10: send event image URL, upload a photo, or type skip.");
+      await ctx.reply("Step 7/11: send event image URL, upload a photo, or type skip.");
       return;
     }
     if (state.step === "eventImageUrl") {
       state.eventImageUrl = text.toLowerCase() === "skip" ? undefined : text;
       state.step = "ticketTemplateImageUrl";
-      await ctx.reply("Step 7/10: send ticket template image URL, upload a photo, or type skip.");
+      await ctx.reply("Step 8/11: send ticket template image URL, upload a photo, or type skip.");
       return;
     }
     if (state.step === "ticketTemplateImageUrl") {
       state.ticketTemplateImageUrl = text.toLowerCase() === "skip" ? undefined : text;
       state.step = "tierAsk";
-      await ctx.reply("Step 8/10: add a tier now? reply yes or no.");
+      await ctx.reply("Step 9/11: add a tier now? reply yes or no.");
       return;
     }
     if (state.step === "tierAsk") {
@@ -707,11 +761,11 @@ if (config.telegramAdminBotToken) {
         return;
       }
       state.step = "confirm";
-      const preview = `Preview:\nName: ${state.name}\nStart: ${state.startsAt}\nEnd: ${state.endsAt}\nLocation: ${state.location ?? "-"}\nDescription: ${state.description ?? "-"}\nEvent image: ${state.eventImageUrl ?? "-"}\nTicket template image: ${state.ticketTemplateImageUrl ?? "-"}\nTiers:\n${state.tiers
+      const preview = `Preview:\nName: ${state.name}\nStart: ${state.startsAt}\nEnd: ${state.endsAt}\nLocation: ${state.location ?? "-"}\nDescription: ${state.description ?? "-"}\nCategory: ${state.category ?? DEFAULT_EVENT_CATEGORY}\nEvent image: ${state.eventImageUrl ?? "-"}\nTicket template image: ${state.ticketTemplateImageUrl ?? "-"}\nTiers:\n${state.tiers
         .map((tier) => `- ${tier.tierName} (${tier.tierCode}) ETB ${tier.price} cap ${tier.capacity ?? "unlimited"}`)
         .join("\n")}`;
       await ctx.reply(preview);
-      await ctx.reply("Step 9/10: type confirm to create event, or /cancel.");
+      await ctx.reply("Step 10/11: type confirm to create event, or /cancel.");
       return;
     }
     if (state.step === "tierCode") {
@@ -780,6 +834,7 @@ if (config.telegramAdminBotToken) {
             endsAt: new Date(endsAtIso),
             location: state.location,
             description: state.description,
+            category: state.category ?? DEFAULT_EVENT_CATEGORY,
             eventImageUrl: state.eventImageUrl,
             ticketTemplateImageUrl: state.ticketTemplateImageUrl,
             status: "published"
@@ -849,14 +904,14 @@ if (config.telegramAdminBotToken) {
       state.eventImageUrl = fileUrl;
       state.step = "ticketTemplateImageUrl";
       await ctx.reply("Event image saved from Telegram upload.");
-      await ctx.reply("Step 7/10: now send ticket template image URL, upload a photo, or type skip.");
+      await ctx.reply("Step 8/11: now send ticket template image URL, upload a photo, or type skip.");
       return;
     }
 
     state.ticketTemplateImageUrl = fileUrl;
     state.step = "tierAsk";
     await ctx.reply("Ticket template image saved from Telegram upload.");
-    await ctx.reply("Step 8/10: add a tier now? reply yes or no.");
+    await ctx.reply("Step 9/11: add a tier now? reply yes or no.");
   });
 }
 
@@ -971,6 +1026,13 @@ if (config.telegramUserBotToken) {
       );
       return;
     }
+    const verifyResult = await resolveReceiptVerification({
+      receiptNo,
+      expectedAmount: Number(order.expectedAmount),
+      receiverNumber: config.telebirrReceiver,
+      receiverName: config.telebirrReceiverName
+    });
+
     const [inserted] = await db
       .insert(receiptSubmissions)
       .values({
@@ -978,23 +1040,43 @@ if (config.telegramUserBotToken) {
         receiptNo,
         receiptUrl: buildReceiptUrl(receiptNo),
         verificationStatus: "verifying",
-        verificationNotes: "Submitted from user bot."
+        verificationNotes: verifyResult.notes
       })
       .returning();
     await db.update(orders).set({ status: "verifying", updatedAt: new Date() }).where(eq(orders.id, order.id));
+
+    let autoApproved = false;
+    if (verifyResult.ok) {
+      const approved = await approveReceiptSubmission({
+        receiptId: inserted.id,
+        verifiedBy: "telebirr_verify_api",
+        verificationNotes: verifyResult.notes,
+        auditMetadata: { orderId: order.id, source: "telebirr_verify_api", channel: "telegram" }
+      });
+      autoApproved = approved.ok;
+    }
+
     await ctx.reply(
-      [
-        "Receipt received and queued for admin verification.",
-        `Order: ${orderRef}`,
-        `Receipt: ${receiptNo}`,
-        `Receipt link: ${buildReceiptUrl(receiptNo)}`,
-        "",
-        "Next steps:",
-        "1) Check progress: /status " + orderRef,
-        "2) After admin approves, claim your QR: /claim " + orderRef,
-        "",
-        "Note: The QR ticket is only sent after approval — submitting receipt does not auto-issue a ticket."
-      ].join("\n")
+      autoApproved
+        ? [
+            "Receipt auto-verified (Telebirr verify API).",
+            `Order: ${orderRef}`,
+            `Receipt: ${receiptNo}`,
+            "",
+            "Claim your QR ticket: /claim " + orderRef
+          ].join("\n")
+        : [
+            "Receipt received and queued for admin verification.",
+            `Order: ${orderRef}`,
+            `Receipt: ${receiptNo}`,
+            `Receipt link: ${buildReceiptUrl(receiptNo)}`,
+            "",
+            "Next steps:",
+            "1) Check progress: /status " + orderRef,
+            "2) After admin approves, claim your QR: /claim " + orderRef,
+            "",
+            "Note: The QR ticket is only sent after approval — submitting receipt does not auto-issue a ticket."
+          ].join("\n")
     );
   });
 

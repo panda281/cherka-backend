@@ -1,6 +1,7 @@
 import express from "express";
 import { and, asc, eq } from "drizzle-orm";
 import { z } from "zod";
+import { EVENT_CATEGORIES, DEFAULT_EVENT_CATEGORY } from "../../constants/eventCategories";
 import { db } from "../../db/client";
 import { eventTiers, events } from "../../db/schema";
 
@@ -10,6 +11,7 @@ const createEventSchema = z.object({
   name: z.string().min(3),
   description: z.string().optional(),
   location: z.string().optional(),
+  category: z.enum(EVENT_CATEGORIES).optional(),
   eventImageUrl: z.string().url().optional(),
   ticketTemplateImageUrl: z.string().url().optional(),
   startsAt: z.string(),
@@ -31,6 +33,7 @@ eventsRouter.post("/admin/events", async (req, res) => {
     .insert(events)
     .values({
       ...data,
+      category: data.category ?? DEFAULT_EVENT_CATEGORY,
       startsAt: new Date(data.startsAt),
       endsAt: new Date(data.endsAt),
       status: data.status ?? "draft"

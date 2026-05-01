@@ -4,6 +4,7 @@ import { z } from "zod";
 import { db } from "../../db/client";
 import { auditLogs, checkins, orders, receiptSubmissions, tickets } from "../../db/schema";
 import { config } from "../../config";
+import { approveReceiptSubmission } from "./approveSubmission";
 
 const approveSchema = z.object({
   verifiedBy: z.string().min(2),
@@ -68,37 +69,24 @@ adminReceiptsRouter.post("/admin/receipt-submissions/:receiptId/approve", async 
     return;
   }
 
-  const [approvedReceipt] = await db
-    .update(receiptSubmissions)
-    .set({
-      verificationStatus: "approved",
-      verifiedBy: body.verifiedBy,
-      verificationNotes: body.notes ?? "Approved by manual verification checklist.",
-      updatedAt: new Date()
-    })
-    .where(eq(receiptSubmissions.id, receipt.id))
-    .returning();
-
-  const [updatedOrder] = await db
-    .update(orders)
-    .set({ status: "approved", updatedAt: new Date() })
-    .where(eq(orders.id, receipt.orderId))
-    .returning();
-
-  await db.insert(auditLogs).values({
-    action: "receipt_approved",
-    actor: body.verifiedBy,
-    entityType: "receipt_submission",
-    entityId: approvedReceipt.id,
-    metadata: JSON.stringify({
+  const outcome = await approveReceiptSubmission({
+    receiptId: receipt.id,
+    verifiedBy: body.verifiedBy,
+    verificationNotes: body.notes ?? "Approved by manual verification checklist.",
+    auditMetadata: {
       orderId: receipt.orderId,
       amountMatched: body.amountMatched,
       receiverMatched: body.receiverMatched,
       timeWindowMatched: body.timeWindowMatched
-    })
+    }
   });
 
-  res.json({ receipt: approvedReceipt, order: updatedOrder });
+  if (!outcome.ok) {
+    res.status(outcome.statusCode).json({ error: outcome.error });
+    return;
+  }
+
+  res.json({ receipt: outcome.receipt, order: outcome.order });
 });
 
 adminReceiptsRouter.post("/admin/receipt-submissions/:receiptId/reject", async (req, res) => {

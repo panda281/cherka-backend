@@ -8,7 +8,8 @@ import { db } from "../../db/client";
 import { eventTiers, orders, receiptSubmissions } from "../../db/schema";
 import { config } from "../../config";
 import { buildOrderRef, buildReceiptUrl, sha256 } from "../../utils";
-import { getVerifier } from "../receipts/verifier";
+import { approveReceiptSubmission } from "../receipts/approveSubmission";
+import { resolveReceiptVerification } from "../receipts/verifier";
 import { rateLimit } from "../../middleware/rateLimit";
 
 const uploadDir = path.resolve("uploads");
@@ -76,13 +77,15 @@ ordersRouter.post("/orders/:orderId/receipt", rateLimit(8, 10 * 60 * 1000), uplo
     return;
   }
 
-  const verifier = getVerifier(body.verifierMode ?? "manual");
-  const result = await verifier.verify({
-    receiptNo: body.receiptNo,
-    expectedAmount: Number(order.expectedAmount),
-    receiverNumber: config.telebirrReceiver,
-    receiverName: config.telebirrReceiverName
-  });
+  const result = await resolveReceiptVerification(
+    {
+      receiptNo: body.receiptNo,
+      expectedAmount: Number(order.expectedAmount),
+      receiverNumber: config.telebirrReceiver,
+      receiverName: config.telebirrReceiverName
+    },
+    { skipExternalApi: body.verifierMode === "manual" }
+  );
 
   const screenshotPath = req.file?.path ?? null;
   const screenshotHash = screenshotPath ? sha256(screenshotPath) : null;
@@ -100,15 +103,27 @@ ordersRouter.post("/orders/:orderId/receipt", rateLimit(8, 10 * 60 * 1000), uplo
     })
     .returning();
 
-  const updatedOrder = await db
-    .update(orders)
-    .set({ status: "verifying", updatedAt: new Date() })
-    .where(eq(orders.id, order.id))
-    .returning();
+  let receiptRow = insertedReceipt[0];
+  await db.update(orders).set({ status: "verifying", updatedAt: new Date() }).where(eq(orders.id, order.id));
+
+  let orderRow = (await db.query.orders.findFirst({ where: eq(orders.id, order.id) }))!;
+
+  if (result.ok) {
+    const approved = await approveReceiptSubmission({
+      receiptId: receiptRow.id,
+      verifiedBy: "telebirr_verify_api",
+      verificationNotes: result.notes,
+      auditMetadata: { orderId: order.id, source: "telebirr_verify_api" }
+    });
+    if (approved.ok) {
+      receiptRow = approved.receipt;
+      orderRow = approved.order;
+    }
+  }
 
   res.status(201).json({
-    receiptSubmission: insertedReceipt[0],
-    order: updatedOrder[0],
+    receiptSubmission: receiptRow,
+    order: orderRow,
     verification: result
   });
 });

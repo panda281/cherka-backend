@@ -45,6 +45,7 @@ export const events = pgTable("events", {
   ticketTemplateImageUrl: text("ticket_template_image_url"),
   startsAt: timestamp("starts_at", { withTimezone: true }).notNull(),
   endsAt: timestamp("ends_at", { withTimezone: true }).notNull(),
+  category: varchar("category", { length: 40 }).default("Music").notNull(),
   status: eventStatusEnum("status").default("draft").notNull(),
   createdAt: now,
   updatedAt

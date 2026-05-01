@@ -23,5 +23,8 @@ export const config = {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean),
-  scannerApiKey: required("SCANNER_API_KEY")
+  scannerApiKey: required("SCANNER_API_KEY"),
+  /** Full POST URL, e.g. http://host:8001/api/verify/verify-telebirr/ — when set, receipt submission runs this unless verifierMode=manual */
+  receiptVerifyTelebirrUrl: (process.env.RECEIPT_VERIFY_TELEBIRR_URL ?? "").trim(),
+  receiptVerifyTimeoutMs: Number(process.env.RECEIPT_VERIFY_TIMEOUT_MS ?? 15000)
 };
