@@ -962,15 +962,40 @@ if (config.telegramUserBotToken) {
       await ctx.reply("Order not found.");
       return;
     }
-    await db.insert(receiptSubmissions).values({
-      orderId: order.id,
-      receiptNo,
-      receiptUrl: buildReceiptUrl(receiptNo),
-      verificationStatus: "verifying",
-      verificationNotes: "Submitted from user bot."
+    const existingReceipt = await db.query.receiptSubmissions.findFirst({
+      where: eq(receiptSubmissions.receiptNo, receiptNo)
     });
+    if (existingReceipt) {
+      await ctx.reply(
+        "This receipt number was already submitted. If that was a mistake, contact support with a different receipt."
+      );
+      return;
+    }
+    const [inserted] = await db
+      .insert(receiptSubmissions)
+      .values({
+        orderId: order.id,
+        receiptNo,
+        receiptUrl: buildReceiptUrl(receiptNo),
+        verificationStatus: "verifying",
+        verificationNotes: "Submitted from user bot."
+      })
+      .returning();
     await db.update(orders).set({ status: "verifying", updatedAt: new Date() }).where(eq(orders.id, order.id));
-    await ctx.reply("Receipt submitted. Please wait for admin verification.");
+    await ctx.reply(
+      [
+        "Receipt received and queued for admin verification.",
+        `Order: ${orderRef}`,
+        `Receipt: ${receiptNo}`,
+        `Receipt link: ${buildReceiptUrl(receiptNo)}`,
+        "",
+        "Next steps:",
+        "1) Check progress: /status " + orderRef,
+        "2) After admin approves, claim your QR: /claim " + orderRef,
+        "",
+        "Note: The QR ticket is only sent after approval — submitting receipt does not auto-issue a ticket."
+      ].join("\n")
+    );
   });
 
   userBot.command("status", async (ctx) => {
@@ -985,7 +1010,28 @@ if (config.telegramUserBotToken) {
       await ctx.reply("Order not found.");
       return;
     }
-    await ctx.reply(`Order ${orderRef} status: ${order.status}`);
+    const latestReceipt = await db.query.receiptSubmissions.findFirst({
+      where: eq(receiptSubmissions.orderId, order.id),
+      orderBy: [desc(receiptSubmissions.createdAt)]
+    });
+    const receiptLine = latestReceipt
+      ? `Latest receipt: ${latestReceipt.receiptNo} (${latestReceipt.verificationStatus})`
+      : "No receipt submitted yet for this order.";
+    await ctx.reply(
+      [
+        `Order ${orderRef}`,
+        `Order status: ${order.status}`,
+        receiptLine,
+        "",
+        order.status === "approved" || order.status === "ticket_issued"
+          ? "You can claim your ticket: /claim " + orderRef
+          : order.status === "verifying"
+            ? "Waiting for admin to verify your receipt. Try again later with /status"
+            : order.status === "rejected"
+              ? "This order was rejected. Contact the organizer if you believe this is wrong."
+              : "Complete payment and submit receipt with /submit " + orderRef + " RECEIPT_NO"
+      ].join("\n")
+    );
   });
 
   userBot.command("claim", async (ctx) => {
