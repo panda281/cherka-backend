@@ -2,6 +2,3 @@ node_modules/
 dist/
 .env
 uploads/
-
-# Frontend lives in a separate repo / deploy; do not commit from this root
-frontend/
