@@ -10,6 +10,8 @@ const createEventSchema = z.object({
   name: z.string().min(3),
   description: z.string().optional(),
   location: z.string().optional(),
+  eventImageUrl: z.string().url().optional(),
+  ticketTemplateImageUrl: z.string().url().optional(),
   startsAt: z.string(),
   endsAt: z.string(),
   status: z.enum(["draft", "published", "closed"]).optional()

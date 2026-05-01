@@ -8,6 +8,13 @@
       "when": 1777619304364,
       "tag": "0000_dizzy_blindfold",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1777667097539,
+      "tag": "0001_loud_kylun",
+      "breakpoints": true
     }
   ]
 }

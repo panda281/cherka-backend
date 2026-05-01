@@ -1,5 +1,5 @@
 import express from "express";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { Markup, Telegraf } from "telegraf";
 import { config } from "../../config";
 import { db } from "../../db/client";
@@ -37,12 +37,47 @@ function isAdminUser(telegramUserId: string): boolean {
   return config.adminTelegramIds.includes(telegramUserId);
 }
 
+type TierDraft = {
+  tierCode: string;
+  tierName: string;
+  price: number;
+  capacity: number | null;
+};
+
+type AdminCreateState = {
+  step:
+    | "name"
+    | "startsAt"
+    | "endsAt"
+    | "location"
+    | "description"
+    | "eventImageUrl"
+    | "ticketTemplateImageUrl"
+    | "tierAsk"
+    | "tierCode"
+    | "tierName"
+    | "tierPrice"
+    | "tierCapacity"
+    | "confirm";
+  name?: string;
+  startsAt?: string;
+  endsAt?: string;
+  location?: string;
+  description?: string;
+  eventImageUrl?: string;
+  ticketTemplateImageUrl?: string;
+  tiers: TierDraft[];
+  draftTier?: Partial<TierDraft>;
+};
+
+const adminCreateState = new Map<string, AdminCreateState>();
+
 if (config.telegramAdminBotToken) {
   adminBot = new Telegraf(config.telegramAdminBotToken);
 
   const adminMenu = Markup.inlineKeyboard([
-    [Markup.button.callback("Create Event Help", "admin_help_newevent")],
-    [Markup.button.callback("Add Tier Help", "admin_help_addtier")],
+    [Markup.button.callback("Create New Event", "admin_create_event_start")],
+    [Markup.button.callback("Event List", "admin_event_list")],
     [Markup.button.callback("View Verify Queue", "admin_verifyqueue")],
     [Markup.button.callback("Show Commands", "admin_show_commands")]
   ]);
@@ -63,25 +98,75 @@ if (config.telegramAdminBotToken) {
     await ctx.reply("Admin quick actions:", adminMenu);
   });
 
-  adminBot.action("admin_help_newevent", async (ctx) => {
+  adminBot.action("admin_create_event_start", async (ctx) => {
     if (!isAdminUser(String(ctx.from.id))) {
       await ctx.answerCbQuery("Unauthorized");
       return;
     }
     await ctx.answerCbQuery();
-    await ctx.reply(
-      "Use:\n/newevent name|startsAtISO|endsAtISO|location|description\nExample:\n/newevent LaunchNight|2026-12-31T17:00:00Z|2026-12-31T23:00:00Z|Addis Ababa|Demo event"
-    );
+    adminCreateState.set(String(ctx.from.id), { step: "name", tiers: [] });
+    await ctx.reply("Creating new event.\nStep 1/10: send event name.");
   });
 
-  adminBot.action("admin_help_addtier", async (ctx) => {
+  adminBot.action("admin_event_list", async (ctx) => {
     if (!isAdminUser(String(ctx.from.id))) {
       await ctx.answerCbQuery("Unauthorized");
       return;
     }
     await ctx.answerCbQuery();
+    const rows = await db.query.events.findMany({
+      orderBy: [desc(events.startsAt)],
+      limit: 20
+    });
+    if (!rows.length) {
+      await ctx.reply("No events yet.");
+      return;
+    }
+    const keyboard = rows.map((eventItem) => [
+      Markup.button.callback(eventItem.name.slice(0, 50), `admin_event_detail:${eventItem.id}`)
+    ]);
+    await ctx.reply("Select event:", Markup.inlineKeyboard(keyboard));
+  });
+
+  adminBot.action(/admin_event_detail:(.+)/, async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    const eventId = ctx.match[1];
+    const eventItem = await db.query.events.findFirst({
+      where: eq(events.id, eventId)
+    });
+    if (!eventItem) {
+      await ctx.reply("Event not found.");
+      return;
+    }
+    const tiers = await db.query.eventTiers.findMany({
+      where: eq(eventTiers.eventId, eventId),
+      orderBy: [eventTiers.tierName]
+    });
+    const soldRows = await db
+      .select({
+        tierId: orders.tierId,
+        sold: sql<number>`count(*)::int`
+      })
+      .from(tickets)
+      .innerJoin(orders, eq(tickets.orderId, orders.id))
+      .where(eq(orders.eventId, eventId))
+      .groupBy(orders.tierId);
+    const soldMap = new Map(soldRows.map((item) => [item.tierId, item.sold]));
+    const tiersText = tiers.length
+      ? tiers
+          .map((tier) => {
+            const sold = soldMap.get(tier.id) ?? 0;
+            return `- ${tier.tierName} (${tier.tierCode}) ETB ${tier.price} | sold ${sold}`;
+          })
+          .join("\n")
+      : "No tiers configured.";
+
     await ctx.reply(
-      "Use:\n/addtier eventId|tierCode|tierName|price|capacity(optional)\nExample:\n/addtier <eventId>|vip|VIP|3000|100"
+      `Event: ${eventItem.name}\nStatus: ${eventItem.status}\nStart: ${eventItem.startsAt.toISOString()}\nEnd: ${eventItem.endsAt.toISOString()}\nLocation: ${eventItem.location ?? "-"}\nEvent image: ${eventItem.eventImageUrl ?? "-"}\nTicket template image: ${eventItem.ticketTemplateImageUrl ?? "-"}\n\nTiers:\n${tiersText}`
     );
   });
 
@@ -113,8 +198,27 @@ if (config.telegramAdminBotToken) {
     }
     await ctx.answerCbQuery();
     await ctx.reply(
-      "Commands:\n/newevent name|startsAtISO|endsAtISO|location|description\n/addtier eventId|tierCode|tierName|price|capacity(optional)\n/verifyqueue\n/approve receiptId\n/reject receiptId reason"
+      "Commands:\n/adminmenu\n/newevent name|startsAtISO|endsAtISO|location|description\n/addtier eventId|tierCode|tierName|price|capacity(optional)\n/eventlist\n/verifyqueue\n/approve receiptId\n/reject receiptId reason"
     );
+  });
+
+  adminBot.command("eventlist", async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.reply("Unauthorized.");
+      return;
+    }
+    const rows = await db.query.events.findMany({
+      orderBy: [desc(events.startsAt)],
+      limit: 20
+    });
+    if (!rows.length) {
+      await ctx.reply("No events yet.");
+      return;
+    }
+    const keyboard = rows.map((eventItem) => [
+      Markup.button.callback(eventItem.name.slice(0, 50), `admin_event_detail:${eventItem.id}`)
+    ]);
+    await ctx.reply("Select event:", Markup.inlineKeyboard(keyboard));
   });
 
   adminBot.command("newevent", async (ctx) => {
@@ -140,6 +244,15 @@ if (config.telegramAdminBotToken) {
       })
       .returning();
     await ctx.reply(`Event created: ${created.name}\nID: ${created.id}`);
+  });
+
+  adminBot.command("cancel", async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.reply("Unauthorized.");
+      return;
+    }
+    adminCreateState.delete(String(ctx.from.id));
+    await ctx.reply("Current wizard cancelled.");
   });
 
   adminBot.command("addtier", async (ctx) => {
@@ -244,6 +357,180 @@ if (config.telegramAdminBotToken) {
       .where(eq(receiptSubmissions.id, receiptId));
     await db.update(orders).set({ status: "rejected", updatedAt: new Date() }).where(eq(orders.id, receipt.orderId));
     await ctx.reply(`Rejected receipt ${receiptId}`);
+  });
+
+  adminBot.on("text", async (ctx, next) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await next();
+      return;
+    }
+    const state = adminCreateState.get(String(ctx.from.id));
+    if (!state) {
+      await next();
+      return;
+    }
+    const text = getText(ctx).trim();
+    if (!text) {
+      await ctx.reply("Please send text value.");
+      return;
+    }
+
+    if (state.step === "name") {
+      state.name = text;
+      state.step = "startsAt";
+      await ctx.reply("Step 2/10: send start date in ISO format (example 2026-12-31T17:00:00Z).");
+      return;
+    }
+    if (state.step === "startsAt") {
+      if (Number.isNaN(Date.parse(text))) {
+        await ctx.reply("Invalid date format. Send ISO date.");
+        return;
+      }
+      state.startsAt = text;
+      state.step = "endsAt";
+      await ctx.reply("Step 3/10: send end date in ISO format.");
+      return;
+    }
+    if (state.step === "endsAt") {
+      if (Number.isNaN(Date.parse(text))) {
+        await ctx.reply("Invalid date format. Send ISO date.");
+        return;
+      }
+      state.endsAt = text;
+      state.step = "location";
+      await ctx.reply("Step 4/10: send location.");
+      return;
+    }
+    if (state.step === "location") {
+      state.location = text;
+      state.step = "description";
+      await ctx.reply("Step 5/10: send description.");
+      return;
+    }
+    if (state.step === "description") {
+      state.description = text;
+      state.step = "eventImageUrl";
+      await ctx.reply("Step 6/10: send event image URL or type skip.");
+      return;
+    }
+    if (state.step === "eventImageUrl") {
+      state.eventImageUrl = text.toLowerCase() === "skip" ? undefined : text;
+      state.step = "ticketTemplateImageUrl";
+      await ctx.reply("Step 7/10: send ticket template image URL or type skip.");
+      return;
+    }
+    if (state.step === "ticketTemplateImageUrl") {
+      state.ticketTemplateImageUrl = text.toLowerCase() === "skip" ? undefined : text;
+      state.step = "tierAsk";
+      await ctx.reply("Step 8/10: add a tier now? reply yes or no.");
+      return;
+    }
+    if (state.step === "tierAsk") {
+      if (text.toLowerCase() === "yes") {
+        state.draftTier = {};
+        state.step = "tierCode";
+        await ctx.reply("Tier step A: send tier code (vip, standard, vvip).");
+        return;
+      }
+      if (text.toLowerCase() !== "no") {
+        await ctx.reply("Reply yes or no.");
+        return;
+      }
+      if (!state.tiers.length) {
+        await ctx.reply("At least one tier is required. Reply yes to add tier.");
+        return;
+      }
+      state.step = "confirm";
+      await ctx.reply("Step 9/10: type confirm to create event, or /cancel.");
+      return;
+    }
+    if (state.step === "tierCode") {
+      state.draftTier = { ...(state.draftTier ?? {}), tierCode: text.toLowerCase() };
+      state.step = "tierName";
+      await ctx.reply("Tier step B: send tier display name.");
+      return;
+    }
+    if (state.step === "tierName") {
+      state.draftTier = { ...(state.draftTier ?? {}), tierName: text };
+      state.step = "tierPrice";
+      await ctx.reply("Tier step C: send price number (example 3000).");
+      return;
+    }
+    if (state.step === "tierPrice") {
+      const price = Number(text);
+      if (Number.isNaN(price) || price <= 0) {
+        await ctx.reply("Invalid price. Send a positive number.");
+        return;
+      }
+      state.draftTier = { ...(state.draftTier ?? {}), price };
+      state.step = "tierCapacity";
+      await ctx.reply("Tier step D: send capacity number, or type skip.");
+      return;
+    }
+    if (state.step === "tierCapacity") {
+      const capacity = text.toLowerCase() === "skip" ? null : Number(text);
+      if (capacity !== null && (Number.isNaN(capacity) || capacity <= 0)) {
+        await ctx.reply("Invalid capacity. Send positive number or skip.");
+        return;
+      }
+      const draft = state.draftTier;
+      if (!draft?.tierCode || !draft.tierName || !draft.price) {
+        await ctx.reply("Tier draft incomplete. Restart with /cancel then /adminmenu.");
+        return;
+      }
+      state.tiers.push({
+        tierCode: draft.tierCode,
+        tierName: draft.tierName,
+        price: draft.price,
+        capacity
+      });
+      state.draftTier = undefined;
+      state.step = "tierAsk";
+      await ctx.reply("Tier added. Add another tier? reply yes or no.");
+      return;
+    }
+    if (state.step === "confirm") {
+      if (text.toLowerCase() !== "confirm") {
+        await ctx.reply("Type confirm to finish, or /cancel.");
+        return;
+      }
+      if (!state.name || !state.startsAt || !state.endsAt) {
+        await ctx.reply("Draft missing required fields. Cancel and restart.");
+        return;
+      }
+      const eventName = state.name;
+      const startsAtIso = state.startsAt;
+      const endsAtIso = state.endsAt;
+      const created = await db.transaction(async (tx) => {
+        const [eventRow] = await tx
+          .insert(events)
+          .values({
+            name: eventName,
+            startsAt: new Date(startsAtIso),
+            endsAt: new Date(endsAtIso),
+            location: state.location,
+            description: state.description,
+            eventImageUrl: state.eventImageUrl,
+            ticketTemplateImageUrl: state.ticketTemplateImageUrl,
+            status: "published"
+          })
+          .returning();
+        await tx.insert(eventTiers).values(
+          state.tiers.map((tier) => ({
+            eventId: eventRow.id,
+            tierCode: tier.tierCode,
+            tierName: tier.tierName,
+            price: tier.price.toFixed(2),
+            capacity: tier.capacity,
+            active: true
+          }))
+        );
+        return eventRow;
+      });
+      adminCreateState.delete(String(ctx.from.id));
+      await ctx.reply(`Event created successfully.\nID: ${created.id}\nName: ${created.name}`);
+      return;
+    }
   });
 }
 
