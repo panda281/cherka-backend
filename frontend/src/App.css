@@ -7,10 +7,14 @@
 }
 
 .hero {
-  background: linear-gradient(135deg, #111827 0%, #312e81 100%);
+  background:
+    radial-gradient(circle at 20% 20%, rgba(34, 211, 238, 0.2), transparent 40%),
+    radial-gradient(circle at 80% 10%, rgba(236, 72, 153, 0.2), transparent 35%),
+    linear-gradient(135deg, #0b1020 0%, #1a1f3a 45%, #2d1b69 100%);
   color: #f9fafb;
   border-radius: 16px;
   padding: 24px;
+  box-shadow: 0 20px 40px rgba(20, 30, 80, 0.35);
 }
 
 .topNav {
@@ -22,6 +26,8 @@
 
 .topNav .brand {
   font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .topNav a {
@@ -57,6 +63,7 @@
   border: 1px solid rgba(255, 255, 255, 0.2);
   border-radius: 12px;
   padding: 14px;
+  backdrop-filter: blur(5px);
 }
 
 .heroStat h3 {
@@ -71,10 +78,10 @@
 }
 
 .card {
-  border: 1px solid #e2e8f0;
+  border: 1px solid #dbe7ff;
   border-radius: 16px;
   padding: 20px;
-  background: #ffffff;
+  background: linear-gradient(180deg, #ffffff 0%, #f7faff 100%);
 }
 
 .card h2 {
@@ -131,10 +138,18 @@ button:disabled {
 }
 
 .eventCard {
-  border: 1px solid #e2e8f0;
+  border: 1px solid #d8e3ff;
   border-radius: 12px;
   padding: 12px;
-  background: #f8fafc;
+  background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+}
+
+.eventImage {
+  width: 100%;
+  height: 170px;
+  object-fit: cover;
+  border-radius: 10px;
+  margin-bottom: 10px;
 }
 
 .eventCard h3 {
@@ -153,16 +168,71 @@ button:disabled {
 }
 
 .tierTag {
-  background: #dbeafe;
-  color: #1e3a8a;
+  background: #eef2ff;
+  color: #2b2f7f;
   font-size: 0.8rem;
   padding: 4px 8px;
   border-radius: 999px;
 }
 
+.buyPanel {
+  border-color: #c7d2fe;
+}
+
+.buyForm {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 10px;
+  align-items: end;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+  color: #1e293b;
+}
+
+select {
+  font-size: 0.95rem;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid #cbd5e1;
+  background: #fff;
+}
+
+input {
+  font-size: 0.95rem;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid #cbd5e1;
+  background: #fff;
+}
+
+.orderCard {
+  margin-top: 8px;
+  border: 1px solid #c7d2fe;
+  background: #eef2ff;
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.orderCard h3 {
+  margin-top: 0;
+}
+
+.receiptInline {
+  margin: 10px 0;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: end;
+}
+
 .cta {
   text-align: center;
   justify-items: center;
+  background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
+  color: #e2e8f0;
 }
 
 .empty {
@@ -179,7 +249,7 @@ button:disabled {
 }
 
 .primaryBtn {
-  background: #1d4ed8;
+  background: linear-gradient(90deg, #2563eb 0%, #7c3aed 100%);
   color: #fff;
 }
 
@@ -200,6 +270,14 @@ button:disabled {
   .heroContent,
   .featureGrid,
   .eventCards {
+    grid-template-columns: 1fr;
+  }
+
+  .buyForm {
+    grid-template-columns: 1fr;
+  }
+
+  .receiptInline {
     grid-template-columns: 1fr;
   }
 

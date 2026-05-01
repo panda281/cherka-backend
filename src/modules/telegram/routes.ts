@@ -45,6 +45,7 @@ type TierDraft = {
 };
 
 type AdminCreateState = {
+  mode: "create";
   step:
     | "name"
     | "startsAt"
@@ -71,9 +72,77 @@ type AdminCreateState = {
 };
 
 const adminCreateState = new Map<string, AdminCreateState>();
+type AdminTierAddState = {
+  eventId: string;
+  step: "tierCode" | "tierName" | "tierPrice" | "tierCapacity";
+  draftTier: Partial<TierDraft>;
+};
+type AdminEditState = {
+  eventId: string;
+  step: "value";
+  field: "name" | "startsAt" | "endsAt" | "location" | "description" | "status" | "eventImageUrl" | "ticketTemplateImageUrl";
+};
+type AdminTierEditState = {
+  eventId: string;
+  tierId: string;
+  field: "tierCode" | "tierName" | "price" | "capacity";
+  step: "value";
+};
+const adminTierAddState = new Map<string, AdminTierAddState>();
+const adminEditState = new Map<string, AdminEditState>();
+const adminTierEditState = new Map<string, AdminTierEditState>();
 
 if (config.telegramAdminBotToken) {
   adminBot = new Telegraf(config.telegramAdminBotToken);
+
+  async function sendEventDetail(chatId: number, eventId: string) {
+    const eventItem = await db.query.events.findFirst({
+      where: eq(events.id, eventId)
+    });
+    if (!eventItem) {
+      await adminBot!.telegram.sendMessage(chatId, "Event not found.");
+      return;
+    }
+    const tiers = await db.query.eventTiers.findMany({
+      where: eq(eventTiers.eventId, eventId),
+      orderBy: [eventTiers.tierName]
+    });
+    const soldRows = await db
+      .select({
+        tierId: orders.tierId,
+        sold: sql<number>`count(*)::int`
+      })
+      .from(tickets)
+      .innerJoin(orders, eq(tickets.orderId, orders.id))
+      .where(eq(orders.eventId, eventId))
+      .groupBy(orders.tierId);
+    const soldMap = new Map(soldRows.map((item) => [item.tierId, item.sold]));
+    const tiersText = tiers.length
+      ? tiers
+          .map((tier) => {
+            const sold = soldMap.get(tier.id) ?? 0;
+            return `- ${tier.tierName} (${tier.tierCode}) ETB ${tier.price} | sold ${sold} | ${tier.active ? "active" : "inactive"}`;
+          })
+          .join("\n")
+      : "No tiers configured.";
+
+    const tierButtons = tiers.flatMap((tier) => [
+      [
+        Markup.button.callback(`Edit ${tier.tierCode}`, `admin_tier_edit:${eventId}:${tier.id}`),
+        Markup.button.callback(tier.active ? `Deactivate ${tier.tierCode}` : `Activate ${tier.tierCode}`, `admin_tier_toggle:${eventId}:${tier.id}`)
+      ]
+    ]);
+
+    await adminBot!.telegram.sendMessage(
+      chatId,
+      `Event: ${eventItem.name}\nStatus: ${eventItem.status}\nStart: ${eventItem.startsAt.toISOString()}\nEnd: ${eventItem.endsAt.toISOString()}\nLocation: ${eventItem.location ?? "-"}\nEvent image: ${eventItem.eventImageUrl ?? "-"}\nTicket template image: ${eventItem.ticketTemplateImageUrl ?? "-"}\n\nTiers:\n${tiersText}`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Add Tier", `admin_event_add_tier:${eventId}`), Markup.button.callback("Edit Event", `admin_event_edit:${eventId}`)],
+        ...tierButtons,
+        [Markup.button.callback("Back to Event List", "admin_event_list")]
+      ])
+    );
+  }
 
   const adminMenu = Markup.inlineKeyboard([
     [Markup.button.callback("Create New Event", "admin_create_event_start")],
@@ -104,7 +173,7 @@ if (config.telegramAdminBotToken) {
       return;
     }
     await ctx.answerCbQuery();
-    adminCreateState.set(String(ctx.from.id), { step: "name", tiers: [] });
+    adminCreateState.set(String(ctx.from.id), { mode: "create", step: "name", tiers: [] });
     await ctx.reply("Creating new event.\nStep 1/10: send event name.");
   });
 
@@ -135,39 +204,114 @@ if (config.telegramAdminBotToken) {
     }
     await ctx.answerCbQuery();
     const eventId = ctx.match[1];
-    const eventItem = await db.query.events.findFirst({
-      where: eq(events.id, eventId)
-    });
-    if (!eventItem) {
-      await ctx.reply("Event not found.");
+    await sendEventDetail(ctx.chat!.id, eventId);
+  });
+
+  adminBot.action(/admin_event_add_tier:(.+)/, async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
       return;
     }
-    const tiers = await db.query.eventTiers.findMany({
-      where: eq(eventTiers.eventId, eventId),
-      orderBy: [eventTiers.tierName]
-    });
-    const soldRows = await db
-      .select({
-        tierId: orders.tierId,
-        sold: sql<number>`count(*)::int`
-      })
-      .from(tickets)
-      .innerJoin(orders, eq(tickets.orderId, orders.id))
-      .where(eq(orders.eventId, eventId))
-      .groupBy(orders.tierId);
-    const soldMap = new Map(soldRows.map((item) => [item.tierId, item.sold]));
-    const tiersText = tiers.length
-      ? tiers
-          .map((tier) => {
-            const sold = soldMap.get(tier.id) ?? 0;
-            return `- ${tier.tierName} (${tier.tierCode}) ETB ${tier.price} | sold ${sold}`;
-          })
-          .join("\n")
-      : "No tiers configured.";
+    await ctx.answerCbQuery();
+    const eventId = ctx.match[1];
+    adminTierAddState.set(String(ctx.from.id), { eventId, step: "tierCode", draftTier: {} });
+    await ctx.reply("Add tier to this event.\nStep A: send tier code.");
+  });
 
+  adminBot.action(/admin_tier_toggle:(.+):(.+)/, async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    const eventId = ctx.match[1];
+    const tierId = ctx.match[2];
+    const tier = await db.query.eventTiers.findFirst({
+      where: and(eq(eventTiers.id, tierId), eq(eventTiers.eventId, eventId))
+    });
+    if (!tier) {
+      await ctx.reply("Tier not found.");
+      return;
+    }
+    await db
+      .update(eventTiers)
+      .set({ active: !tier.active, updatedAt: new Date() })
+      .where(eq(eventTiers.id, tier.id));
+    await ctx.reply(`Tier ${tier.tierCode} is now ${tier.active ? "inactive" : "active"}.`);
+    await sendEventDetail(ctx.chat!.id, eventId);
+  });
+
+  adminBot.action(/admin_tier_edit:(.+):(.+)/, async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    const eventId = ctx.match[1];
+    const tierId = ctx.match[2];
     await ctx.reply(
-      `Event: ${eventItem.name}\nStatus: ${eventItem.status}\nStart: ${eventItem.startsAt.toISOString()}\nEnd: ${eventItem.endsAt.toISOString()}\nLocation: ${eventItem.location ?? "-"}\nEvent image: ${eventItem.eventImageUrl ?? "-"}\nTicket template image: ${eventItem.ticketTemplateImageUrl ?? "-"}\n\nTiers:\n${tiersText}`
+      "Choose tier field to edit:",
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Code", `admin_tier_edit_field:${eventId}:${tierId}:tierCode`), Markup.button.callback("Name", `admin_tier_edit_field:${eventId}:${tierId}:tierName`)],
+        [Markup.button.callback("Price", `admin_tier_edit_field:${eventId}:${tierId}:price`), Markup.button.callback("Capacity", `admin_tier_edit_field:${eventId}:${tierId}:capacity`)],
+        [Markup.button.callback("Back", `admin_event_detail:${eventId}`)]
+      ])
     );
+  });
+
+  adminBot.action(/admin_tier_edit_field:(.+):(.+):(.+)/, async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    const eventId = ctx.match[1];
+    const tierId = ctx.match[2];
+    const field = ctx.match[3] as AdminTierEditState["field"];
+    adminTierEditState.set(String(ctx.from.id), { eventId, tierId, field, step: "value" });
+    await ctx.reply(`Send new value for ${field}. For capacity you can send skip for unlimited.`);
+  });
+
+  adminBot.action(/admin_event_edit:(.+)/, async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    const eventId = ctx.match[1];
+    await ctx.reply(
+      "Choose field to edit:",
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Name", `admin_edit_field:${eventId}:name`), Markup.button.callback("Start Date", `admin_edit_field:${eventId}:startsAt`)],
+        [Markup.button.callback("End Date", `admin_edit_field:${eventId}:endsAt`), Markup.button.callback("Location", `admin_edit_field:${eventId}:location`)],
+        [Markup.button.callback("Description", `admin_edit_field:${eventId}:description`), Markup.button.callback("Status", `admin_edit_field:${eventId}:status`)],
+        [Markup.button.callback("Event Image URL", `admin_edit_field:${eventId}:eventImageUrl`)],
+        [Markup.button.callback("Ticket Template URL", `admin_edit_field:${eventId}:ticketTemplateImageUrl`)],
+        [Markup.button.callback("Done", `admin_edit_done:${eventId}`)]
+      ])
+    );
+  });
+
+  adminBot.action(/admin_edit_field:(.+):(.+)/, async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    const eventId = ctx.match[1];
+    const field = ctx.match[2] as AdminEditState["field"];
+    adminEditState.set(String(ctx.from.id), { eventId, step: "value", field });
+    await ctx.reply(`Send new value for ${field}. For image fields you can send URL, upload photo, or type skip.`);
+  });
+
+  adminBot.action(/admin_edit_done:(.+)/, async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    adminEditState.delete(String(ctx.from.id));
+    await sendEventDetail(ctx.chat!.id, ctx.match[1]);
   });
 
   adminBot.action("admin_verifyqueue", async (ctx) => {
@@ -252,6 +396,9 @@ if (config.telegramAdminBotToken) {
       return;
     }
     adminCreateState.delete(String(ctx.from.id));
+    adminTierAddState.delete(String(ctx.from.id));
+    adminEditState.delete(String(ctx.from.id));
+    adminTierEditState.delete(String(ctx.from.id));
     await ctx.reply("Current wizard cancelled.");
   });
 
@@ -365,13 +512,132 @@ if (config.telegramAdminBotToken) {
       return;
     }
     const state = adminCreateState.get(String(ctx.from.id));
-    if (!state) {
+    const tierState = adminTierAddState.get(String(ctx.from.id));
+    const editState = adminEditState.get(String(ctx.from.id));
+    const tierEditState = adminTierEditState.get(String(ctx.from.id));
+    if (!state && !tierState && !editState && !tierEditState) {
       await next();
       return;
     }
     const text = getText(ctx).trim();
     if (!text) {
       await ctx.reply("Please send text value.");
+      return;
+    }
+
+    if (tierState) {
+      if (tierState.step === "tierCode") {
+        tierState.draftTier.tierCode = text.toLowerCase();
+        tierState.step = "tierName";
+        await ctx.reply("Step B: send tier name.");
+        return;
+      }
+      if (tierState.step === "tierName") {
+        tierState.draftTier.tierName = text;
+        tierState.step = "tierPrice";
+        await ctx.reply("Step C: send tier price.");
+        return;
+      }
+      if (tierState.step === "tierPrice") {
+        const price = Number(text);
+        if (Number.isNaN(price) || price <= 0) {
+          await ctx.reply("Invalid price. Send positive number.");
+          return;
+        }
+        tierState.draftTier.price = price;
+        tierState.step = "tierCapacity";
+        await ctx.reply("Step D: send capacity or type skip.");
+        return;
+      }
+      const capacity = text.toLowerCase() === "skip" ? null : Number(text);
+      if (capacity !== null && (Number.isNaN(capacity) || capacity <= 0)) {
+        await ctx.reply("Invalid capacity. Send positive number or skip.");
+        return;
+      }
+      if (!tierState.draftTier.tierCode || !tierState.draftTier.tierName || !tierState.draftTier.price) {
+        await ctx.reply("Tier draft invalid. /cancel and retry.");
+        return;
+      }
+      await db.insert(eventTiers).values({
+        eventId: tierState.eventId,
+        tierCode: tierState.draftTier.tierCode,
+        tierName: tierState.draftTier.tierName,
+        price: tierState.draftTier.price.toFixed(2),
+        capacity,
+        active: true
+      });
+      adminTierAddState.delete(String(ctx.from.id));
+      await ctx.reply("Tier added.");
+      await sendEventDetail(ctx.chat!.id, tierState.eventId);
+      return;
+    }
+
+    if (editState) {
+      const value =
+        editState.field === "eventImageUrl" || editState.field === "ticketTemplateImageUrl"
+          ? text.toLowerCase() === "skip"
+            ? null
+            : text
+          : text;
+      if ((editState.field === "startsAt" || editState.field === "endsAt") && Number.isNaN(Date.parse(text))) {
+        await ctx.reply("Invalid date. Send ISO date.");
+        return;
+      }
+      if (editState.field === "status" && !["draft", "published", "closed"].includes(text)) {
+        await ctx.reply("Status must be draft, published, or closed.");
+        return;
+      }
+      const patch: Record<string, unknown> = { updatedAt: new Date() };
+      if (editState.field === "startsAt" || editState.field === "endsAt") {
+        patch[editState.field] = new Date(text);
+      } else {
+        patch[editState.field] = value;
+      }
+      await db.update(events).set(patch).where(eq(events.id, editState.eventId));
+      adminEditState.delete(String(ctx.from.id));
+      await ctx.reply("Event updated.");
+      await sendEventDetail(ctx.chat!.id, editState.eventId);
+      return;
+    }
+
+    if (tierEditState) {
+      const tier = await db.query.eventTiers.findFirst({
+        where: and(eq(eventTiers.id, tierEditState.tierId), eq(eventTiers.eventId, tierEditState.eventId))
+      });
+      if (!tier) {
+        adminTierEditState.delete(String(ctx.from.id));
+        await ctx.reply("Tier not found.");
+        return;
+      }
+      const patch: Record<string, unknown> = { updatedAt: new Date() };
+      if (tierEditState.field === "price") {
+        const price = Number(text);
+        if (Number.isNaN(price) || price <= 0) {
+          await ctx.reply("Invalid price. Send positive number.");
+          return;
+        }
+        patch.price = price.toFixed(2);
+      } else if (tierEditState.field === "capacity") {
+        const cap = text.toLowerCase() === "skip" ? null : Number(text);
+        if (cap !== null && (Number.isNaN(cap) || cap <= 0)) {
+          await ctx.reply("Invalid capacity. Send positive number or skip.");
+          return;
+        }
+        patch.capacity = cap;
+      } else if (tierEditState.field === "tierCode") {
+        patch.tierCode = text.toLowerCase();
+      } else {
+        patch.tierName = text;
+      }
+      await db.update(eventTiers).set(patch).where(eq(eventTiers.id, tier.id));
+      adminTierEditState.delete(String(ctx.from.id));
+      await ctx.reply("Tier updated.");
+      await sendEventDetail(ctx.chat!.id, tierEditState.eventId);
+      return;
+    }
+
+    if (!state) {
+      await next();
       return;
     }
 
@@ -410,13 +676,13 @@ if (config.telegramAdminBotToken) {
     if (state.step === "description") {
       state.description = text;
       state.step = "eventImageUrl";
-      await ctx.reply("Step 6/10: send event image URL or type skip.");
+      await ctx.reply("Step 6/10: send event image URL, upload a photo, or type skip.");
       return;
     }
     if (state.step === "eventImageUrl") {
       state.eventImageUrl = text.toLowerCase() === "skip" ? undefined : text;
       state.step = "ticketTemplateImageUrl";
-      await ctx.reply("Step 7/10: send ticket template image URL or type skip.");
+      await ctx.reply("Step 7/10: send ticket template image URL, upload a photo, or type skip.");
       return;
     }
     if (state.step === "ticketTemplateImageUrl") {
@@ -441,6 +707,10 @@ if (config.telegramAdminBotToken) {
         return;
       }
       state.step = "confirm";
+      const preview = `Preview:\nName: ${state.name}\nStart: ${state.startsAt}\nEnd: ${state.endsAt}\nLocation: ${state.location ?? "-"}\nDescription: ${state.description ?? "-"}\nEvent image: ${state.eventImageUrl ?? "-"}\nTicket template image: ${state.ticketTemplateImageUrl ?? "-"}\nTiers:\n${state.tiers
+        .map((tier) => `- ${tier.tierName} (${tier.tierCode}) ETB ${tier.price} cap ${tier.capacity ?? "unlimited"}`)
+        .join("\n")}`;
+      await ctx.reply(preview);
       await ctx.reply("Step 9/10: type confirm to create event, or /cancel.");
       return;
     }
@@ -531,6 +801,62 @@ if (config.telegramAdminBotToken) {
       await ctx.reply(`Event created successfully.\nID: ${created.id}\nName: ${created.name}`);
       return;
     }
+  });
+
+  adminBot.on("photo", async (ctx, next) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await next();
+      return;
+    }
+    const state = adminCreateState.get(String(ctx.from.id));
+    const editState = adminEditState.get(String(ctx.from.id));
+    if (!state) {
+      if (!editState) {
+        await next();
+        return;
+      }
+    }
+    if (editState && (editState.field === "eventImageUrl" || editState.field === "ticketTemplateImageUrl")) {
+      const photos = ctx.message.photo;
+      const best = photos[photos.length - 1];
+      if (!best) {
+        await ctx.reply("Could not read photo. Try again.");
+        return;
+      }
+      const fileUrl = (await ctx.telegram.getFileLink(best.file_id)).toString();
+      const patch: Record<string, unknown> = { updatedAt: new Date() };
+      patch[editState.field] = fileUrl;
+      await db.update(events).set(patch).where(eq(events.id, editState.eventId));
+      adminEditState.delete(String(ctx.from.id));
+      await ctx.reply("Event image updated from uploaded photo.");
+      await sendEventDetail(ctx.chat!.id, editState.eventId);
+      return;
+    }
+    if (!state || (state.step !== "eventImageUrl" && state.step !== "ticketTemplateImageUrl")) {
+      await ctx.reply("Photo received, but wizard is not currently asking for an image.");
+      return;
+    }
+
+    const photos = ctx.message.photo;
+    const best = photos[photos.length - 1];
+    if (!best) {
+      await ctx.reply("Could not read photo. Try again.");
+      return;
+    }
+    const fileUrl = (await ctx.telegram.getFileLink(best.file_id)).toString();
+
+    if (state.step === "eventImageUrl") {
+      state.eventImageUrl = fileUrl;
+      state.step = "ticketTemplateImageUrl";
+      await ctx.reply("Event image saved from Telegram upload.");
+      await ctx.reply("Step 7/10: now send ticket template image URL, upload a photo, or type skip.");
+      return;
+    }
+
+    state.ticketTemplateImageUrl = fileUrl;
+    state.step = "tierAsk";
+    await ctx.reply("Ticket template image saved from Telegram upload.");
+    await ctx.reply("Step 8/10: add a tier now? reply yes or no.");
   });
 }
 
