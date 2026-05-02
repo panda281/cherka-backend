@@ -25,6 +25,11 @@ export const config = {
     .filter(Boolean),
   scannerApiKey: required("SCANNER_API_KEY"),
   /** Full POST URL, e.g. http://host:8001/api/verify/verify-telebirr/ — when set, receipt submission runs this unless verifierMode=manual */
-  receiptVerifyTelebirrUrl: (process.env.RECEIPT_VERIFY_TELEBIRR_URL ?? "").trim(),
-  receiptVerifyTimeoutMs: Number(process.env.RECEIPT_VERIFY_TIMEOUT_MS ?? 15000)
+  /** POST JSON `{ "receipt_no": "..." }` — full URL including path, no spaces (e.g. …8001/api/verify/verify-telebirr/). */
+  receiptVerifyTelebirrUrl: (process.env.RECEIPT_VERIFY_TELEBIRR_URL ?? "")
+    .trim()
+    .replace(/\s+/g, ""),
+  receiptVerifyTimeoutMs: Number(process.env.RECEIPT_VERIFY_TIMEOUT_MS ?? 15000),
+  /** If true, auto-approve only checks amount (not credited party). Less safe — demo only. */
+  receiptVerifySkipReceiverCheck: process.env.RECEIPT_VERIFY_SKIP_RECEIVER_CHECK === "true"
 };

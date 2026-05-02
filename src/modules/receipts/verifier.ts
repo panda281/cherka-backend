@@ -28,6 +28,16 @@ function normalizeEthioPhone(raw: string | null | undefined): string {
   return digits;
 }
 
+/** Compare Telebirr-style accounts (+251… vs 09…). */
+function ethioReceiverMatches(apiValue: string, configuredReceiver: string): boolean {
+  const a = normalizeEthioPhone(apiValue).replace(/\D/g, "");
+  const b = normalizeEthioPhone(configuredReceiver).replace(/\D/g, "");
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const tail = (s: string) => (s.length >= 9 ? s.slice(-9) : s);
+  return tail(a) === tail(b);
+}
+
 function paidAmountFromTelebirrData(data: Record<string, unknown>): number | null {
   const total = data.total_paid;
   if (total != null && total !== "") {
@@ -132,16 +142,20 @@ export class ParserReceiptVerifier implements ReceiptVerifier {
       }
 
       const creditedRaw = data.credited_party_account_no;
-      const credited =
+      const hasCredited =
         typeof creditedRaw === "string" || typeof creditedRaw === "number"
-          ? normalizeEthioPhone(String(creditedRaw))
-          : "";
-      const expectedRecv = normalizeEthioPhone(input.receiverNumber);
-      if (credited && expectedRecv && credited !== expectedRecv) {
+          ? String(creditedRaw).trim().length > 0
+          : false;
+
+      if (
+        !config.receiptVerifySkipReceiverCheck &&
+        hasCredited &&
+        !ethioReceiverMatches(String(creditedRaw), input.receiverNumber)
+      ) {
         return {
           ok: false,
           mode: "parser",
-          notes: `Receiver mismatch: receipt credits ${String(creditedRaw)}, expected ${input.receiverNumber}.`,
+          notes: `Receiver mismatch: receipt credits ${String(creditedRaw)}, expected ${input.receiverNumber}. Set RECEIPT_VERIFY_SKIP_RECEIVER_CHECK=true only for demos.`,
           receiptUrl
         };
       }

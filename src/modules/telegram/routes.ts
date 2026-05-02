@@ -1,6 +1,7 @@
 import express from "express";
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { Markup, Telegraf } from "telegraf";
+import type { Context } from "telegraf";
 import { config } from "../../config";
 import { DEFAULT_EVENT_CATEGORY, EVENT_CATEGORIES, parseEventCategory } from "../../constants/eventCategories";
 import { db } from "../../db/client";
@@ -186,6 +187,37 @@ if (config.telegramAdminBotToken) {
           .join("\n")
       : "No tiers configured.";
 
+    const issuedRows = await db
+      .select({
+        tierCode: eventTiers.tierCode,
+        tierName: eventTiers.tierName,
+        orderRef: orders.orderRef,
+        telegramUserId: tickets.telegramUserId,
+        ticketStatus: tickets.status
+      })
+      .from(tickets)
+      .innerJoin(orders, eq(tickets.orderId, orders.id))
+      .innerJoin(eventTiers, eq(orders.tierId, eventTiers.id))
+      .where(eq(orders.eventId, eventId))
+      .orderBy(desc(tickets.createdAt));
+
+    const salesDetail =
+      issuedRows.length === 0
+        ? "Issued tickets: none yet."
+        : [
+            `Issued tickets (${issuedRows.length}) — tier · order · buyer Telegram ID · status`,
+            ...issuedRows.slice(0, 30).map(
+              (r) =>
+                `- ${r.tierName} (${r.tierCode}) · ${r.orderRef} · ${r.telegramUserId} · ${r.ticketStatus}`
+            ),
+            ...(issuedRows.length > 30 ? [`… +${issuedRows.length - 30} more (export DB for full list)`] : [])
+          ].join("\n");
+
+    let detailBody = `Event: ${eventItem.name}\nCategory: ${eventItem.category}\nStatus: ${eventItem.status}\nStart: ${eventItem.startsAt.toISOString()}\nEnd: ${eventItem.endsAt.toISOString()}\nLocation: ${eventItem.location ?? "-"}\nEvent image: ${eventItem.eventImageUrl ?? "-"}\nTicket template image: ${eventItem.ticketTemplateImageUrl ?? "-"}\n\nTiers:\n${tiersText}\n\n${salesDetail}`;
+    if (detailBody.length > 3900) {
+      detailBody = `${detailBody.slice(0, 3880)}\n… (message truncated)`;
+    }
+
     const tierButtons = tiers.flatMap((tier) => [
       [
         Markup.button.callback(`Edit ${tier.tierCode}`, telegramCallbackData(`t_edit:${tier.id}`)),
@@ -198,7 +230,7 @@ if (config.telegramAdminBotToken) {
 
     await adminBot!.telegram.sendMessage(
       chatId,
-      `Event: ${eventItem.name}\nCategory: ${eventItem.category}\nStatus: ${eventItem.status}\nStart: ${eventItem.startsAt.toISOString()}\nEnd: ${eventItem.endsAt.toISOString()}\nLocation: ${eventItem.location ?? "-"}\nEvent image: ${eventItem.eventImageUrl ?? "-"}\nTicket template image: ${eventItem.ticketTemplateImageUrl ?? "-"}\n\nTiers:\n${tiersText}`,
+      detailBody,
       Markup.inlineKeyboard([
         [
           Markup.button.callback("Add Tier", telegramCallbackData(`eat:${eventId}`)),
@@ -1027,8 +1059,79 @@ if (config.telegramUserBotToken) {
     [Markup.button.callback("My Tickets", telegramCallbackData("user_myticket"))]
   ]);
 
+  function orderRefFromDeepLink(ctx: Context): string | undefined {
+    const p = (ctx as Context & { startPayload?: string }).startPayload?.trim();
+    if (p) {
+      try {
+        return decodeURIComponent(p).trim();
+      } catch {
+        return p;
+      }
+    }
+    const text = ctx.message && "text" in ctx.message ? String(ctx.message.text ?? "") : "";
+    const m = /^\/start(?:@\w+)?\s+(\S+)/i.exec(text.trim());
+    return m ? m[1].trim() : undefined;
+  }
+
+  async function replyWithIssuedTicket(
+    ctx: Context,
+    orderRef: string,
+    ticket: Awaited<ReturnType<typeof issueTicketForApprovedOrder>>
+  ) {
+    await ctx.replyWithPhoto({ source: Buffer.from(ticket.qrImageDataUrl.split(",")[1], "base64") }, {
+      caption: `Ticket issued for order ${orderRef}. This QR can be used once.`
+    });
+  }
+
+  async function tryAutoClaimApprovedWithoutTicket(ctx: Context): Promise<boolean> {
+    const tgId = String(ctx.from?.id ?? "");
+    if (!tgId) return false;
+    const row = await db
+      .select({ orderRef: orders.orderRef })
+      .from(orders)
+      .leftJoin(tickets, eq(tickets.orderId, orders.id))
+      .where(and(eq(orders.telegramUserId, tgId), eq(orders.status, "approved"), isNull(tickets.id)))
+      .limit(1);
+    const first = row[0];
+    if (!first) return false;
+    try {
+      const ticket = await issueTicketForApprovedOrder(first.orderRef, tgId);
+      await replyWithIssuedTicket(ctx, first.orderRef, ticket);
+      await ctx.reply(
+        "/start claimed your ticket automatically — this Telegram account is linked to that order.",
+        userMenu
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   userBot.start(async (ctx) => {
-    await ctx.reply("Welcome. Open menu with /menu", userMenu);
+    const tgId = String(ctx.from?.id ?? "");
+    const deepRef = orderRefFromDeepLink(ctx);
+    if (deepRef) {
+      await db.update(orders).set({ telegramUserId: tgId, updatedAt: new Date() }).where(eq(orders.orderRef, deepRef));
+      try {
+        const ticket = await issueTicketForApprovedOrder(deepRef, tgId);
+        await replyWithIssuedTicket(ctx, deepRef, ticket);
+        await ctx.reply(
+          "Tip: share a deep link with ?start=" + deepRef + " so guests open the bot and get this QR in one step.",
+          userMenu
+        );
+        return;
+      } catch (e) {
+        await ctx.reply(e instanceof Error ? e.message : "Could not issue ticket yet.", userMenu);
+        return;
+      }
+    }
+    if (await tryAutoClaimApprovedWithoutTicket(ctx)) {
+      return;
+    }
+    await ctx.reply(
+      "Welcome. Use /menu for shortcuts.\n\nAfter you submit a receipt from this chat, your account is linked — sending /start later can claim your ticket automatically once approved.",
+      userMenu
+    );
   });
 
   userBot.command("menu", async (ctx) => {
@@ -1119,6 +1222,10 @@ if (config.telegramUserBotToken) {
       await ctx.reply("Order not found.");
       return;
     }
+    await db
+      .update(orders)
+      .set({ telegramUserId: String(ctx.from!.id), updatedAt: new Date() })
+      .where(eq(orders.id, order.id));
     const existingReceipt = await db.query.receiptSubmissions.findFirst({
       where: eq(receiptSubmissions.receiptNo, receiptNo)
     });
@@ -1158,27 +1265,39 @@ if (config.telegramUserBotToken) {
       autoApproved = approved.ok;
     }
 
+    if (autoApproved) {
+      try {
+        const ticket = await issueTicketForApprovedOrder(orderRef, String(ctx.from!.id));
+        await replyWithIssuedTicket(ctx, orderRef, ticket);
+        await ctx.reply("Receipt auto-approved — your QR is above. Use /menu for more.", userMenu);
+        return;
+      } catch {
+        await ctx.reply(
+          [
+            "Receipt auto-verified, but the QR could not be issued yet. Try: /claim " + orderRef,
+            "",
+            verifyResult.notes
+          ].join("\n"),
+          userMenu
+        );
+        return;
+      }
+    }
+
     await ctx.reply(
-      autoApproved
-        ? [
-            "Receipt auto-verified (Telebirr verify API).",
-            `Order: ${orderRef}`,
-            `Receipt: ${receiptNo}`,
-            "",
-            "Claim your QR ticket: /claim " + orderRef
-          ].join("\n")
-        : [
-            "Receipt received and queued for admin verification.",
-            `Order: ${orderRef}`,
-            `Receipt: ${receiptNo}`,
-            `Receipt link: ${buildReceiptUrl(receiptNo)}`,
-            "",
-            "Next steps:",
-            "1) Check progress: /status " + orderRef,
-            "2) After admin approves, claim your QR: /claim " + orderRef,
-            "",
-            "Note: The QR ticket is only sent after approval — submitting receipt does not auto-issue a ticket."
-          ].join("\n")
+      [
+        "Receipt received and queued for admin verification.",
+        `Order: ${orderRef}`,
+        `Receipt: ${receiptNo}`,
+        `Receipt link: ${buildReceiptUrl(receiptNo)}`,
+        "",
+        "Next steps:",
+        "1) Check progress: /status " + orderRef,
+        "2) After approval: /claim " + orderRef + " or just send /start (your account is linked).",
+        "",
+        "If auto-verify is configured but failed, check VERIFY logs — amount and receiver must match TELEBIRR_RECEIVER."
+      ].join("\n"),
+      userMenu
     );
   });
 
@@ -1194,6 +1313,10 @@ if (config.telegramUserBotToken) {
       await ctx.reply("Order not found.");
       return;
     }
+    await db
+      .update(orders)
+      .set({ telegramUserId: String(ctx.from!.id), updatedAt: new Date() })
+      .where(eq(orders.id, order.id));
     const latestReceipt = await db.query.receiptSubmissions.findFirst({
       where: eq(receiptSubmissions.orderId, order.id),
       orderBy: [desc(receiptSubmissions.createdAt)]
@@ -1225,11 +1348,13 @@ if (config.telegramUserBotToken) {
       await ctx.reply("Usage: /claim ORDER_REF");
       return;
     }
+    await db
+      .update(orders)
+      .set({ telegramUserId: String(ctx.from!.id), updatedAt: new Date() })
+      .where(eq(orders.orderRef, orderRef));
     try {
       const ticket = await issueTicketForApprovedOrder(orderRef, String(ctx.from.id));
-      await ctx.replyWithPhoto({ source: Buffer.from(ticket.qrImageDataUrl.split(",")[1], "base64") }, {
-        caption: `Ticket issued for order ${orderRef}. This QR can be used once.`
-      });
+      await replyWithIssuedTicket(ctx, orderRef, ticket);
     } catch (error) {
       await ctx.reply(error instanceof Error ? error.message : "Unable to claim ticket.");
     }

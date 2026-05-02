@@ -82,6 +82,8 @@ export const orders = pgTable("orders", {
   orderRef: varchar("order_ref", { length: 32 }).notNull().unique(),
   expectedAmount: numeric("expected_amount", { precision: 12, scale: 2 }).notNull(),
   payerPhone: varchar("payer_phone", { length: 20 }),
+  /** Set when user interacts via Telegram user bot — used for /start auto-claim */
+  telegramUserId: varchar("telegram_user_id", { length: 50 }),
   status: orderStatusEnum("status").default("pending_receipt").notNull(),
   createdAt: now,
   updatedAt

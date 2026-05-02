@@ -1,0 +1,1 @@
+ALTER TABLE "orders" ADD COLUMN "telegram_user_id" varchar(50);

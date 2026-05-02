@@ -54,7 +54,7 @@ export async function issueTicketForApprovedOrder(orderRef: string, telegramUser
     await tx
       .update(orders)
       .set({ status: "ticket_issued", updatedAt: new Date() })
-      .where(and(eq(orders.id, order.id), eq(orders.status, order.status)));
+      .where(and(eq(orders.id, order.id), eq(orders.status, "approved")));
 
     await tx.insert(auditLogs).values({
       action: "ticket_claimed",
