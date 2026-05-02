@@ -5,6 +5,7 @@ import { z } from "zod";
 import { db } from "../../db/client";
 import { config } from "../../config";
 import { auditLogs, checkins, tickets } from "../../db/schema";
+import { formatAuditActor, formatScanActor, requireScanAuth } from "../scanner/scanAuth";
 
 const scanSchema = z.object({
   qrToken: z.string().min(10),
@@ -13,20 +14,16 @@ const scanSchema = z.object({
 
 export const checkinRouter = express.Router();
 
-checkinRouter.post("/checkin/scan", async (req, res) => {
-  const apiKey = req.headers["x-scanner-api-key"];
-  if (apiKey !== config.scannerApiKey) {
-    res.status(401).json({ result: "invalid", reason: "Invalid scanner API key." });
-    return;
-  }
-
+checkinRouter.post("/checkin/scan", requireScanAuth, async (req, res) => {
   const body = scanSchema.parse(req.body);
+  const scanActor = formatScanActor(body.scannerDeviceId, req.scanAuth);
+  const auditActor = formatAuditActor(body.scannerDeviceId, req.scanAuth);
   let decoded: { jti: string } | null = null;
   try {
     decoded = jwt.verify(body.qrToken, config.jwtSecret) as { jti: string };
   } catch {
     await db.insert(checkins).values({
-      scannerDeviceId: body.scannerDeviceId,
+      scannerDeviceId: scanActor,
       result: "invalid",
       details: "Invalid ticket signature."
     });
@@ -53,7 +50,7 @@ checkinRouter.post("/checkin/scan", async (req, res) => {
     if (ticket.status !== "unused") {
       await tx.insert(checkins).values({
         ticketId: ticket.id,
-        scannerDeviceId: body.scannerDeviceId,
+        scannerDeviceId: scanActor,
         result: "already_used",
         details: `Ticket first used at ${ticket.used_at?.toISOString() ?? "unknown"} by ${ticket.used_by_gate ?? "unknown"}.`
       });
@@ -66,21 +63,21 @@ checkinRouter.post("/checkin/scan", async (req, res) => {
 
     await tx
       .update(tickets)
-      .set({ status: "used", usedAt: new Date(), usedByGate: body.scannerDeviceId, updatedAt: new Date() })
+      .set({ status: "used", usedAt: new Date(), usedByGate: scanActor, updatedAt: new Date() })
       .where(eq(tickets.id, ticket.id));
 
     await tx.insert(checkins).values({
       ticketId: ticket.id,
-      scannerDeviceId: body.scannerDeviceId,
+      scannerDeviceId: scanActor,
       result: "valid",
       details: "First successful scan."
     });
     await tx.insert(auditLogs).values({
       action: "ticket_scanned",
-      actor: body.scannerDeviceId,
+      actor: auditActor,
       entityType: "ticket",
       entityId: ticket.id,
-      metadata: JSON.stringify({ result: "valid" })
+      metadata: JSON.stringify({ result: "valid", scannerDeviceId: body.scannerDeviceId })
     });
 
     return { result: "valid" as const };

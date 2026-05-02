@@ -144,3 +144,12 @@ export const auditLogs = pgTable("audit_logs", {
   metadata: text("metadata"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull()
 });
+
+/** Gate / scanner web app users — seeded manually; passwords stored as bcrypt hashes */
+export const scannerUsers = pgTable("scanner_users", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  username: varchar("username", { length: 64 }).notNull().unique(),
+  passwordHash: varchar("password_hash", { length: 128 }).notNull(),
+  createdAt: now,
+  updatedAt
+});

@@ -9,6 +9,7 @@
     "start": "node dist/server.js",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
+    "seed:scanner": "tsx scripts/seed-scanner-user.ts",
     "test": "echo \"No tests yet\"",
     "install:all": "npm install && npm install --prefix frontend",
     "sync:locks": "npm install --package-lock-only && npm install --package-lock-only --prefix frontend"
@@ -18,6 +19,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
@@ -32,6 +34,7 @@
     "zod": "^4.4.1"
   },
   "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",

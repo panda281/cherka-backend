@@ -8,6 +8,7 @@ import { ordersRouter } from "./modules/orders/routes";
 import { adminReceiptsRouter } from "./modules/receipts/adminRoutes";
 import { telegramRouter } from "./modules/telegram/routes";
 import { checkinRouter } from "./modules/checkin/routes";
+import { scannerAuthRouter } from "./modules/scanner/authRoutes";
 
 export const app = express();
 
@@ -25,6 +26,7 @@ app.use(eventsRouter);
 app.use(ordersRouter);
 app.use(adminReceiptsRouter);
 app.use(telegramRouter);
+app.use(scannerAuthRouter);
 app.use(checkinRouter);
 
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {

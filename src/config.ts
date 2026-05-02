@@ -33,5 +33,7 @@ export const config = {
     .replace(/\s+/g, ""),
   receiptVerifyTimeoutMs: Number(process.env.RECEIPT_VERIFY_TIMEOUT_MS ?? 15000),
   /** If true, auto-approve only checks amount (not `credited_party_name`). Less safe — demo only. */
-  receiptVerifySkipReceiverCheck: process.env.RECEIPT_VERIFY_SKIP_RECEIVER_CHECK === "true"
+  receiptVerifySkipReceiverCheck: process.env.RECEIPT_VERIFY_SKIP_RECEIVER_CHECK === "true",
+  /** Scanner web login JWT lifetime (same secret as tickets but different payload shape) */
+  scannerSessionDays: Number(process.env.SCANNER_SESSION_DAYS ?? "3")
 };
