@@ -6,6 +6,7 @@ import { db } from "../../db/client";
 import { config } from "../../config";
 import { auditLogs, checkins, tickets } from "../../db/schema";
 import { formatAuditActor, formatScanActor, requireScanAuth } from "../scanner/scanAuth";
+import { sendPostCheckinThankYouTelegram } from "../telegram/postScanThankYou";
 
 const scanSchema = z.object({
   qrToken: z.string().min(10),
@@ -18,12 +19,23 @@ type ScanGuestPayload = {
   eventName: string;
 };
 
+type ScanTransactionResult =
+  | { result: "invalid"; message: string }
+  | { result: "already_used"; guest: ScanGuestPayload | null; message: string }
+  | {
+      result: "valid";
+      guest: ScanGuestPayload | null;
+      message: string;
+      /** Server-only: DM thank-you after response */
+      notifyTelegramUserId?: string;
+    };
+
 async function loadGuestPayload(
   tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
   ticketId: string
-): Promise<ScanGuestPayload | null> {
+): Promise<{ guest: ScanGuestPayload; telegramUserId: string } | null> {
   const rows = await tx.execute(sql`
-    SELECT t.telegram_username, et.tier_name, e.name AS event_name
+    SELECT t.telegram_username, t.telegram_user_id, et.tier_name, e.name AS event_name
     FROM tickets t
     INNER JOIN orders o ON o.id = t.order_id
     INNER JOIN event_tiers et ON et.id = o.tier_id
@@ -31,7 +43,12 @@ async function loadGuestPayload(
     WHERE t.id = ${ticketId}
   `);
   const r = rows.rows[0] as
-    | { telegram_username: string | null; tier_name: string; event_name: string }
+    | {
+        telegram_username: string | null;
+        telegram_user_id: string;
+        tier_name: string;
+        event_name: string;
+      }
     | undefined;
   if (!r) return null;
   const holder =
@@ -39,9 +56,12 @@ async function loadGuestPayload(
       ? `@${r.telegram_username.trim().replace(/^@/, "")}`
       : "Guest";
   return {
-    holder,
-    ticketType: r.tier_name,
-    eventName: r.event_name
+    guest: {
+      holder,
+      ticketType: r.tier_name,
+      eventName: r.event_name
+    },
+    telegramUserId: String(r.telegram_user_id).trim()
   };
 }
 
@@ -86,7 +106,8 @@ checkinRouter.post("/checkin/scan", requireScanAuth, async (req, res) => {
       };
     }
 
-    const guest = await loadGuestPayload(tx, ticket.id);
+    const enriched = await loadGuestPayload(tx, ticket.id);
+    const guest = enriched?.guest ?? null;
 
     if (ticket.status !== "unused") {
       await tx.insert(checkins).values({
@@ -121,12 +142,25 @@ checkinRouter.post("/checkin/scan", requireScanAuth, async (req, res) => {
       metadata: JSON.stringify({ result: "valid", scannerDeviceId: body.scannerDeviceId })
     });
 
-    return {
-      result: "valid" as const,
+    const result: ScanTransactionResult = {
+      result: "valid",
       guest,
       message: "Valid ticket. You may enter."
     };
+    if (enriched?.telegramUserId) {
+      (result as Extract<ScanTransactionResult, { result: "valid" }>).notifyTelegramUserId =
+        enriched.telegramUserId;
+    }
+    return result;
   });
 
-  res.json(outcome);
+  if (outcome.result === "valid" && outcome.notifyTelegramUserId) {
+    sendPostCheckinThankYouTelegram(outcome.notifyTelegramUserId);
+  }
+
+  const publicBody =
+    outcome.result === "valid"
+      ? { result: outcome.result, guest: outcome.guest, message: outcome.message }
+      : outcome;
+  res.json(publicBody);
 });

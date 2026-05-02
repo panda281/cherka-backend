@@ -35,5 +35,7 @@ export const config = {
   /** If true, auto-approve only checks amount (not `credited_party_name`). Less safe — demo only. */
   receiptVerifySkipReceiverCheck: process.env.RECEIPT_VERIFY_SKIP_RECEIVER_CHECK === "true",
   /** Scanner web login JWT lifetime (same secret as tickets but different payload shape) */
-  scannerSessionDays: Number(process.env.SCANNER_SESSION_DAYS ?? "3")
+  scannerSessionDays: Number(process.env.SCANNER_SESSION_DAYS ?? "3"),
+  /** t.me/+… or https://t.me/… — sent in a DM after successful check-in (requires TELEGRAM_USER_BOT_TOKEN) */
+  ticketrCommunityChannelUrl: (process.env.TICKETR_COMMUNITY_CHANNEL_URL ?? "").trim()
 };
