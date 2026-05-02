@@ -8,6 +8,7 @@ import { db } from "../../db/client";
 import { eventTiers, events, orders, receiptSubmissions, tickets } from "../../db/schema";
 import { buildReceiptUrl } from "../../utils";
 import { approveReceiptSubmission } from "../receipts/approveSubmission";
+import { reverifyReceiptWithTelebirrApi } from "../receipts/reverifySubmission";
 import { logReceiptVerify } from "../receipts/verifyLogging";
 import { resolveReceiptVerification } from "../receipts/verifier";
 import { issueTicketForApprovedOrder } from "../tickets/service";
@@ -567,9 +568,11 @@ if (config.telegramAdminBotToken) {
       await ctx.reply("No receipts waiting verification.");
       return;
     }
-    const text = queue
-      .map((item) => `receiptId=${item.id}\norderId=${item.orderId}\nreceiptNo=${item.receiptNo}`)
-      .join("\n\n");
+    const text = [
+      ...queue.map((item) => `receiptId=${item.id}\norderId=${item.orderId}\nreceiptNo=${item.receiptNo}`),
+      "",
+      "Re-run Telebirr on one: /reverify <receiptId>"
+    ].join("\n");
     await ctx.reply(text);
   });
 
@@ -580,7 +583,7 @@ if (config.telegramAdminBotToken) {
     }
     await ctx.answerCbQuery();
     await ctx.reply(
-      "Commands:\n/adminmenu\n/newevent name|…|category(optional)|featured yes/no(optional)\nEvent List: category filter buttons\n/addtier eventId|…\n/verifyqueue\n/approve /reject …"
+      "Commands:\n/adminmenu\n/newevent name|…|category(optional)|featured yes/no(optional)\nEvent List: category filter buttons\n/addtier eventId|…\n/verifyqueue\n/approve /reject /reverify …"
     );
   });
 
@@ -692,10 +695,61 @@ if (config.telegramAdminBotToken) {
       await ctx.reply("No receipts waiting verification.");
       return;
     }
-    const text = queue
-      .map((item) => `receiptId=${item.id}\norderId=${item.orderId}\nreceiptNo=${item.receiptNo}`)
-      .join("\n\n");
+    const text = [
+      ...queue.map((item) => `receiptId=${item.id}\norderId=${item.orderId}\nreceiptNo=${item.receiptNo}`),
+      "",
+      "Re-run Telebirr on one: /reverify <receiptId>"
+    ].join("\n");
     await ctx.reply(text);
+  });
+
+  adminBot.command("reverify", async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.reply("Unauthorized.");
+      return;
+    }
+    const args = getArgs(getText(ctx));
+    const receiptId = parseReceiptIdArg(args[0]);
+    if (!receiptId) {
+      await ctx.reply(
+        "Usage: /reverify RECEIPT_UUID\nRuns the Telebirr verify API again for a receipt still in “verifying”. If it passes, the order is approved and the buyer gets the QR (when their Telegram is linked to the order).\n\nSame receipt ID format as /approve."
+      );
+      return;
+    }
+    await ctx.reply("Re-verifying with Telebirr API…");
+    const result = await reverifyReceiptWithTelebirrApi({
+      receiptId,
+      verifiedBy: `admin_tg:${ctx.from.id}`
+    });
+    if (!result.ok) {
+      await ctx.reply(result.message);
+      return;
+    }
+    let reply = `OK — order ${result.orderRef}\n${result.verificationNotes}`;
+    if (!result.telegramUserId) {
+      reply += "\n\nNo Telegram account linked on this order yet — the buyer should open the user bot and use /claim ORDER_REF (or submit receipt from Telegram to link).";
+    } else if (!result.hasTicket) {
+      reply += "\n\nTicket could not be created automatically; buyer can try /claim.";
+    }
+    await ctx.reply(reply);
+    if (result.hasTicket && result.ticket && result.telegramUserId && userBot) {
+      try {
+        await userBot.telegram.sendPhoto(
+          result.telegramUserId,
+          { source: Buffer.from(result.ticket.qrImageDataUrl.split(",")[1], "base64") },
+          {
+            caption: `Ticket for order ${result.orderRef}. Payment verified — this QR can be used once.`
+          }
+        );
+        await ctx.reply("QR sent to the buyer via the user bot.");
+      } catch (err) {
+        await ctx.reply(
+          `Order approved and ticket saved, but sending the QR to the user failed: ${err instanceof Error ? err.message : String(err)} (blocked bot / invalid chat).`
+        );
+      }
+    } else if (result.hasTicket && result.ticket && result.telegramUserId && !userBot) {
+      await ctx.reply("User bot token not configured — could not push QR. Ticket is stored; buyer can use /myticket on the user bot.");
+    }
   });
 
   adminBot.command("approve", async (ctx) => {
@@ -1211,6 +1265,52 @@ if (config.telegramUserBotToken) {
     });
   }
 
+  /**
+   * Approved + paid (Telebirr) but order still has no Telegram link and no ticket yet — e.g. receipt submitted via web API.
+   * If exactly one such order exists globally, link this chat (ctx.from.id) and issue the ticket.
+   * If several exist, user must /claim with order ref (avoids wrong account grabbing someone else's ticket).
+   */
+  async function tryLinkChatAndClaimSingleUnlinkedApprovedOrder(ctx: Context): Promise<boolean> {
+    const tgId = String(ctx.from?.id ?? "");
+    if (!tgId) return false;
+
+    const unlinked = await db
+      .select({ orderRef: orders.orderRef })
+      .from(orders)
+      .leftJoin(tickets, eq(tickets.orderId, orders.id))
+      .where(and(eq(orders.status, "approved"), isNull(orders.telegramUserId), isNull(tickets.id)));
+
+    if (unlinked.length === 0) return false;
+    if (unlinked.length > 1) {
+      await ctx.reply(
+        [
+          "More than one order is waiting to be linked to Telegram.",
+          "Use: /claim YOUR_ORDER_REF",
+          "(Copy the order reference from your payment or confirmation page.)"
+        ].join("\n"),
+        userMenu
+      );
+      return true;
+    }
+
+    const orderRef = unlinked[0]!.orderRef;
+    await db.update(orders).set({ telegramUserId: tgId, updatedAt: new Date() }).where(eq(orders.orderRef, orderRef));
+    try {
+      const ticket = await issueTicketForApprovedOrder(orderRef, tgId, {
+        telegramUsername: ctx.from?.username
+      });
+      await replyWithIssuedTicket(ctx, orderRef, ticket);
+      await ctx.reply(
+        "Linked this chat to your order (your Telegram id from /start) and sent your ticket above.",
+        userMenu
+      );
+      return true;
+    } catch (e) {
+      await ctx.reply(e instanceof Error ? e.message : "Could not issue ticket yet.", userMenu);
+      return true;
+    }
+  }
+
   async function tryAutoClaimApprovedWithoutTicket(ctx: Context): Promise<boolean> {
     const tgId = String(ctx.from?.id ?? "");
     if (!tgId) return false;
@@ -1257,11 +1357,14 @@ if (config.telegramUserBotToken) {
         return;
       }
     }
+    if (await tryLinkChatAndClaimSingleUnlinkedApprovedOrder(ctx)) {
+      return;
+    }
     if (await tryAutoClaimApprovedWithoutTicket(ctx)) {
       return;
     }
     await ctx.reply(
-      "Welcome. Use /menu for shortcuts.\n\nAfter you submit a receipt from this chat, your account is linked — sending /start later can claim your ticket automatically once approved.",
+      "Welcome. Use /menu for shortcuts.\n\nIf you paid on the web and your payment is already verified, tap /start again after approval or use /claim YOUR_ORDER_REF. If you submit a receipt from this chat, your account is linked automatically.",
       userMenu
     );
   });

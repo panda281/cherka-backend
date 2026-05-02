@@ -16,6 +16,8 @@ export const config = {
   jwtSecret: required("JWT_SECRET"),
   telegramAdminBotToken: process.env.TELEGRAM_ADMIN_BOT_TOKEN ?? "",
   telegramUserBotToken: process.env.TELEGRAM_USER_BOT_TOKEN ?? "",
+  /** Public @username of the user ticket bot (no @). Used for `t.me/...?start=ORDER_REF` after web checkout. */
+  telegramUserBotUsername: (process.env.TELEGRAM_USER_BOT_USERNAME ?? "").trim().replace(/^@/, ""),
   telegramAdminWebhookSecret: required("TELEGRAM_ADMIN_WEBHOOK_SECRET"),
   telegramUserWebhookSecret: required("TELEGRAM_USER_WEBHOOK_SECRET"),
   telegramSetupSecret: required("TELEGRAM_SETUP_SECRET"),

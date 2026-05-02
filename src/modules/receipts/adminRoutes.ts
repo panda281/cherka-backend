@@ -5,6 +5,7 @@ import { db } from "../../db/client";
 import { auditLogs, checkins, orders, receiptSubmissions, tickets } from "../../db/schema";
 import { config } from "../../config";
 import { approveReceiptSubmission } from "./approveSubmission";
+import { reverifyReceiptWithTelebirrApi } from "./reverifySubmission";
 
 const approveSchema = z.object({
   verifiedBy: z.string().min(2),
@@ -12,6 +13,10 @@ const approveSchema = z.object({
   receiverMatched: z.boolean(),
   timeWindowMatched: z.boolean(),
   notes: z.string().optional()
+});
+
+const reverifySchema = z.object({
+  verifiedBy: z.string().min(2)
 });
 
 const rejectSchema = z.object({
@@ -87,6 +92,28 @@ adminReceiptsRouter.post("/admin/receipt-submissions/:receiptId/approve", async 
   }
 
   res.json({ receipt: outcome.receipt, order: outcome.order });
+});
+
+/** Re-run Telebirr API on a receipt still in `verifying`; approve + issue ticket when possible (QR push only via admin Telegram /reverify). */
+adminReceiptsRouter.post("/admin/receipt-submissions/:receiptId/reverify", async (req, res) => {
+  const body = reverifySchema.parse(req.body);
+  const result = await reverifyReceiptWithTelebirrApi({
+    receiptId: req.params.receiptId,
+    verifiedBy: body.verifiedBy
+  });
+  if (!result.ok) {
+    res.status(400).json({ error: result.message, receiptId: result.receiptId });
+    return;
+  }
+  res.json({
+    ok: true,
+    orderRef: result.orderRef,
+    receiptId: result.receiptId,
+    verificationNotes: result.verificationNotes,
+    hasTicket: result.hasTicket,
+    ticketId: result.ticket?.id ?? null,
+    telegramUserId: result.telegramUserId
+  });
 });
 
 adminReceiptsRouter.post("/admin/receipt-submissions/:receiptId/reject", async (req, res) => {
