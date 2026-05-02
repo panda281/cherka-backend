@@ -72,7 +72,8 @@ const EVENT_FIELD_BY_CODE: Record<string, AdminEditState["field"]> = {
   c: "category",
   t: "status",
   i: "eventImageUrl",
-  m: "ticketTemplateImageUrl"
+  m: "ticketTemplateImageUrl",
+  f: "featured"
 };
 
 /** Accepts raw UUID or copy-paste from verify queue like `receiptId=<uuid>`. */
@@ -106,6 +107,7 @@ type AdminCreateState = {
     | "category"
     | "eventImageUrl"
     | "ticketTemplateImageUrl"
+    | "featuredAsk"
     | "tierAsk"
     | "tierCode"
     | "tierName"
@@ -120,6 +122,7 @@ type AdminCreateState = {
   category?: string;
   eventImageUrl?: string;
   ticketTemplateImageUrl?: string;
+  featured?: boolean;
   tiers: TierDraft[];
   draftTier?: Partial<TierDraft>;
 };
@@ -142,7 +145,8 @@ type AdminEditState = {
     | "category"
     | "status"
     | "eventImageUrl"
-    | "ticketTemplateImageUrl";
+    | "ticketTemplateImageUrl"
+    | "featured";
 };
 type AdminTierEditState = {
   eventId: string;
@@ -195,7 +199,7 @@ if (config.telegramAdminBotToken) {
       .where(eq(orders.eventId, eventId));
     const issuedCount = issuedRow?.n ?? 0;
 
-    const detailBody = `Event: ${eventItem.name}\nCategory: ${eventItem.category}\nStatus: ${eventItem.status}\nStart: ${eventItem.startsAt.toISOString()}\nEnd: ${eventItem.endsAt.toISOString()}\nLocation: ${eventItem.location ?? "-"}\nEvent image: ${eventItem.eventImageUrl ?? "-"}\nTicket template image: ${eventItem.ticketTemplateImageUrl ?? "-"}\n\nTiers:\n${tiersText}\n\nIssued tickets: ${issuedCount} — use the “Ticket holders” button below for the full list.`;
+    const detailBody = `Event: ${eventItem.name}\nCategory: ${eventItem.category}\nFeatured: ${eventItem.featured ? "yes (shown first on lists)" : "no"}\nStatus: ${eventItem.status}\nStart: ${eventItem.startsAt.toISOString()}\nEnd: ${eventItem.endsAt.toISOString()}\nLocation: ${eventItem.location ?? "-"}\nEvent image: ${eventItem.eventImageUrl ?? "-"}\nTicket template image: ${eventItem.ticketTemplateImageUrl ?? "-"}\n\nTiers:\n${tiersText}\n\nIssued tickets: ${issuedCount} — use the “Ticket holders” button below for the full list.`;
 
     const tierButtons = tiers.flatMap((tier) => [
       [
@@ -264,6 +268,55 @@ if (config.telegramAdminBotToken) {
     }
   }
 
+  function parseElfCategoryToken(token: string): { label: string; category: string | null } {
+    const t = token.trim();
+    if (!t || t === "All") return { label: "All categories", category: null };
+    const parsed = parseEventCategory(t);
+    if (parsed) return { label: parsed, category: parsed };
+    const exact = EVENT_CATEGORIES.find((c) => c === t);
+    if (exact) return { label: exact, category: exact };
+    return { label: "All categories", category: null };
+  }
+
+  function buildCategoryFilterRows() {
+    const allBtn = Markup.button.callback("All", telegramCallbackData("elf:All"));
+    const catBtns = EVENT_CATEGORIES.map((c) =>
+      Markup.button.callback(c, telegramCallbackData(`elf:${c}`))
+    );
+    return [
+      [allBtn, catBtns[0]!, catBtns[1]!, catBtns[2]!],
+      [catBtns[3]!, catBtns[4]!, catBtns[5]!]
+    ];
+  }
+
+  async function sendAdminEventList(chatId: number, elfToken: string) {
+    const { label, category } = parseElfCategoryToken(elfToken);
+    const rows = await db.query.events.findMany({
+      where: category ? eq(events.category, category) : undefined,
+      orderBy: [desc(events.featured), desc(events.startsAt)],
+      limit: 25
+    });
+    const filterRows = buildCategoryFilterRows();
+    if (!rows.length) {
+      await adminBot!.telegram.sendMessage(
+        chatId,
+        `No events in “${label}”. Pick another category below.`,
+        Markup.inlineKeyboard(filterRows)
+      );
+      return;
+    }
+    const eventRows = rows.map((eventItem) => {
+      const prefix = eventItem.featured ? "[F] " : "";
+      const title = `${prefix}${eventItem.name}`.slice(0, 56);
+      return [Markup.button.callback(title, telegramCallbackData(`evd:${eventItem.id}`))];
+    });
+    await adminBot!.telegram.sendMessage(
+      chatId,
+      `Events — ${label} (${rows.length}). Featured [F] sort first. Tap filter or open an event.`,
+      Markup.inlineKeyboard([...filterRows, ...eventRows])
+    );
+  }
+
   const adminMenu = Markup.inlineKeyboard([
     [Markup.button.callback("Create New Event", telegramCallbackData("nw"))],
     [Markup.button.callback("Event List", telegramCallbackData("lst"))],
@@ -294,7 +347,7 @@ if (config.telegramAdminBotToken) {
     }
     await ctx.answerCbQuery();
     adminCreateState.set(String(ctx.from.id), { mode: "create", step: "name", tiers: [] });
-    await ctx.reply("Creating new event.\nStep 1/11: send event name.");
+    await ctx.reply("Creating new event.\nStep 1/12: send event name.");
   });
 
   adminBot.action("lst", async (ctx) => {
@@ -303,18 +356,17 @@ if (config.telegramAdminBotToken) {
       return;
     }
     await ctx.answerCbQuery();
-    const rows = await db.query.events.findMany({
-      orderBy: [desc(events.startsAt)],
-      limit: 20
-    });
-    if (!rows.length) {
-      await ctx.reply("No events yet.");
+    await sendAdminEventList(ctx.chat!.id, "All");
+  });
+
+  adminBot.action(new RegExp(`^elf:(.+)$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
       return;
     }
-    const keyboard = rows.map((eventItem) => [
-      Markup.button.callback(eventItem.name.slice(0, 50), telegramCallbackData(`evd:${eventItem.id}`))
-    ]);
-    await ctx.reply("Select event:", Markup.inlineKeyboard(keyboard));
+    await ctx.answerCbQuery();
+    const token = ctx.match![1];
+    await sendAdminEventList(ctx.chat!.id, token);
   });
 
   adminBot.action(new RegExp(`^evd:${CB_UUID}$`), async (ctx) => {
@@ -458,6 +510,7 @@ if (config.telegramAdminBotToken) {
           Markup.button.callback("Event Image URL", telegramCallbackData(`e_f:${eventId}:i`))
         ],
         [Markup.button.callback("Ticket Template URL", telegramCallbackData(`e_f:${eventId}:m`))],
+        [Markup.button.callback("Featured (list order)", telegramCallbackData(`e_f:${eventId}:f`))],
         [Markup.button.callback("Done", telegramCallbackData(`edo:${eventId}`))]
       ])
     );
@@ -477,7 +530,11 @@ if (config.telegramAdminBotToken) {
       return;
     }
     adminEditState.set(String(ctx.from.id), { eventId, step: "value", field });
-    await ctx.reply(`Send new value for ${field}. For image fields you can send URL, upload photo, or type skip.`);
+    await ctx.reply(
+      field === "featured"
+        ? "Featured events appear first on public /events and user Browse. Send yes or no."
+        : `Send new value for ${field}. For image fields you can send URL, upload photo, or type skip.`
+    );
   });
 
   adminBot.action(new RegExp(`^edo:${CB_UUID}$`), async (ctx) => {
@@ -518,7 +575,7 @@ if (config.telegramAdminBotToken) {
     }
     await ctx.answerCbQuery();
     await ctx.reply(
-      "Commands:\n/adminmenu\n/newevent name|startsAtISO|endsAtISO|location|description|category(optional)\n/addtier eventId|tierCode|tierName|price|capacity(optional)\n/eventlist\n/verifyqueue\n/approve receiptId\n/reject receiptId reason"
+      "Commands:\n/adminmenu\n/newevent name|…|category(optional)|featured yes/no(optional)\nEvent List: category filter buttons\n/addtier eventId|…\n/verifyqueue\n/approve /reject …"
     );
   });
 
@@ -527,18 +584,7 @@ if (config.telegramAdminBotToken) {
       await ctx.reply("Unauthorized.");
       return;
     }
-    const rows = await db.query.events.findMany({
-      orderBy: [desc(events.startsAt)],
-      limit: 20
-    });
-    if (!rows.length) {
-      await ctx.reply("No events yet.");
-      return;
-    }
-    const keyboard = rows.map((eventItem) => [
-      Markup.button.callback(eventItem.name.slice(0, 50), telegramCallbackData(`evd:${eventItem.id}`))
-    ]);
-    await ctx.reply("Select event:", Markup.inlineKeyboard(keyboard));
+    await sendAdminEventList(ctx.chat!.id, "All");
   });
 
   adminBot.command("newevent", async (ctx) => {
@@ -547,10 +593,12 @@ if (config.telegramAdminBotToken) {
       return;
     }
     const payload = getText(ctx).replace("/newevent", "").trim();
-    const [name, startsAt, endsAt, location, description, categoryRaw] = payload.split("|").map((item) => item.trim());
+    const [name, startsAt, endsAt, location, description, categoryRaw, featuredRaw] = payload
+      .split("|")
+      .map((item) => item.trim());
     if (!name || !startsAt || !endsAt) {
       await ctx.reply(
-        "Usage: /newevent name|startsAtISO|endsAtISO|location|description|category(optional)\nCategory: Music, Festivals, Arts, Exhibitions, Sports, Tech"
+        "Usage: /newevent name|startsAtISO|endsAtISO|location|description|category(optional)|featured(optional yes/no)\nCategory: Music, Festivals, Arts, Exhibitions, Sports, Tech"
       );
       return;
     }
@@ -563,6 +611,15 @@ if (config.telegramAdminBotToken) {
       }
       finalCategory = parsed;
     }
+    let featured = false;
+    if (featuredRaw) {
+      const fr = featuredRaw.toLowerCase();
+      featured = ["yes", "y", "true", "1"].includes(fr);
+      if (!featured && !["no", "n", "false", "0"].includes(fr)) {
+        await ctx.reply("Featured must be yes or no (last field).");
+        return;
+      }
+    }
     const [created] = await db
       .insert(events)
       .values({
@@ -572,6 +629,7 @@ if (config.telegramAdminBotToken) {
         location,
         description,
         category: finalCategory,
+        featured,
         status: "published"
       })
       .returning();
@@ -765,6 +823,23 @@ if (config.telegramAdminBotToken) {
     }
 
     if (editState) {
+      if (editState.field === "featured") {
+        const t = text.toLowerCase();
+        const yes = ["yes", "y", "true", "1"].includes(t);
+        const no = ["no", "n", "false", "0"].includes(t);
+        if (!yes && !no) {
+          await ctx.reply("Send yes or no.");
+          return;
+        }
+        await db
+          .update(events)
+          .set({ featured: yes, updatedAt: new Date() })
+          .where(eq(events.id, editState.eventId));
+        adminEditState.delete(String(ctx.from.id));
+        await ctx.reply(`Featured set to ${yes ? "on" : "off"}.`);
+        await sendEventDetail(ctx.chat!.id, editState.eventId);
+        return;
+      }
       if (editState.field === "category") {
         const cat = parseEventCategory(text);
         if (!cat) {
@@ -851,7 +926,7 @@ if (config.telegramAdminBotToken) {
     if (state.step === "name") {
       state.name = text;
       state.step = "startsAt";
-      await ctx.reply("Step 2/11: send start date in ISO format (example 2026-12-31T17:00:00Z).");
+      await ctx.reply("Step 2/12: send start date in ISO format (example 2026-12-31T17:00:00Z).");
       return;
     }
     if (state.step === "startsAt") {
@@ -861,7 +936,7 @@ if (config.telegramAdminBotToken) {
       }
       state.startsAt = text;
       state.step = "endsAt";
-      await ctx.reply("Step 3/11: send end date in ISO format.");
+      await ctx.reply("Step 3/12: send end date in ISO format.");
       return;
     }
     if (state.step === "endsAt") {
@@ -871,20 +946,20 @@ if (config.telegramAdminBotToken) {
       }
       state.endsAt = text;
       state.step = "location";
-      await ctx.reply("Step 4/11: send location.");
+      await ctx.reply("Step 4/12: send location.");
       return;
     }
     if (state.step === "location") {
       state.location = text;
       state.step = "description";
-      await ctx.reply("Step 5/11: send description.");
+      await ctx.reply("Step 5/12: send description.");
       return;
     }
     if (state.step === "description") {
       state.description = text;
       state.step = "category";
       await ctx.reply(
-        `Step 6/11: send category. One of: ${EVENT_CATEGORIES.join(", ")} (default if unsure: Music).`
+        `Step 6/12: send category. One of: ${EVENT_CATEGORIES.join(", ")} (default if unsure: Music).`
       );
       return;
     }
@@ -896,19 +971,34 @@ if (config.telegramAdminBotToken) {
       }
       state.category = cat;
       state.step = "eventImageUrl";
-      await ctx.reply("Step 7/11: send event image URL, upload a photo, or type skip.");
+      await ctx.reply("Step 7/12: send event image URL, upload a photo, or type skip.");
       return;
     }
     if (state.step === "eventImageUrl") {
       state.eventImageUrl = text.toLowerCase() === "skip" ? undefined : text;
       state.step = "ticketTemplateImageUrl";
-      await ctx.reply("Step 8/11: send ticket template image URL, upload a photo, or type skip.");
+      await ctx.reply("Step 8/12: send ticket template image URL, upload a photo, or type skip.");
       return;
     }
     if (state.step === "ticketTemplateImageUrl") {
       state.ticketTemplateImageUrl = text.toLowerCase() === "skip" ? undefined : text;
+      state.step = "featuredAsk";
+      await ctx.reply(
+        "Step 9/12: feature this event (shown first in Browse + /events)? Send yes or no."
+      );
+      return;
+    }
+    if (state.step === "featuredAsk") {
+      const t = text.toLowerCase();
+      const yes = ["yes", "y", "true", "1"].includes(t);
+      const no = ["no", "n", "false", "0"].includes(t);
+      if (!yes && !no) {
+        await ctx.reply("Send yes or no.");
+        return;
+      }
+      state.featured = yes;
       state.step = "tierAsk";
-      await ctx.reply("Step 9/11: add a tier now? reply yes or no.");
+      await ctx.reply("Step 10/12: add a tier now? reply yes or no.");
       return;
     }
     if (state.step === "tierAsk") {
@@ -927,11 +1017,11 @@ if (config.telegramAdminBotToken) {
         return;
       }
       state.step = "confirm";
-      const preview = `Preview:\nName: ${state.name}\nStart: ${state.startsAt}\nEnd: ${state.endsAt}\nLocation: ${state.location ?? "-"}\nDescription: ${state.description ?? "-"}\nCategory: ${state.category ?? DEFAULT_EVENT_CATEGORY}\nEvent image: ${state.eventImageUrl ?? "-"}\nTicket template image: ${state.ticketTemplateImageUrl ?? "-"}\nTiers:\n${state.tiers
+      const preview = `Preview:\nName: ${state.name}\nStart: ${state.startsAt}\nEnd: ${state.endsAt}\nLocation: ${state.location ?? "-"}\nDescription: ${state.description ?? "-"}\nCategory: ${state.category ?? DEFAULT_EVENT_CATEGORY}\nFeatured: ${state.featured ? "yes" : "no"}\nEvent image: ${state.eventImageUrl ?? "-"}\nTicket template image: ${state.ticketTemplateImageUrl ?? "-"}\nTiers:\n${state.tiers
         .map((tier) => `- ${tier.tierName} (${tier.tierCode}) ETB ${tier.price} cap ${tier.capacity ?? "unlimited"}`)
         .join("\n")}`;
       await ctx.reply(preview);
-      await ctx.reply("Step 10/11: type confirm to create event, or /cancel.");
+      await ctx.reply("Step 11/12: type confirm to create event, or /cancel.");
       return;
     }
     if (state.step === "tierCode") {
@@ -1001,6 +1091,7 @@ if (config.telegramAdminBotToken) {
             location: state.location,
             description: state.description,
             category: state.category ?? DEFAULT_EVENT_CATEGORY,
+            featured: state.featured ?? false,
             eventImageUrl: state.eventImageUrl,
             ticketTemplateImageUrl: state.ticketTemplateImageUrl,
             status: "published"
@@ -1070,14 +1161,14 @@ if (config.telegramAdminBotToken) {
       state.eventImageUrl = fileUrl;
       state.step = "ticketTemplateImageUrl";
       await ctx.reply("Event image saved from Telegram upload.");
-      await ctx.reply("Step 8/11: now send ticket template image URL, upload a photo, or type skip.");
+      await ctx.reply("Step 8/12: now send ticket template image URL, upload a photo, or type skip.");
       return;
     }
 
     state.ticketTemplateImageUrl = fileUrl;
-    state.step = "tierAsk";
+    state.step = "featuredAsk";
     await ctx.reply("Ticket template image saved from Telegram upload.");
-    await ctx.reply("Step 9/11: add a tier now? reply yes or no.");
+    await ctx.reply("Step 9/12: feature this event? Send yes or no.");
   });
 }
 
@@ -1174,7 +1265,7 @@ if (config.telegramUserBotToken) {
     await ctx.answerCbQuery();
     const activeEvents = await db.query.events.findMany({
       where: inArray(events.status, ["published"]),
-      orderBy: [desc(events.startsAt)]
+      orderBy: [desc(events.featured), desc(events.startsAt)]
     });
     if (!activeEvents.length) {
       await ctx.reply("No published events found.");
@@ -1189,7 +1280,8 @@ if (config.telegramUserBotToken) {
         .filter((tier) => tier.eventId === eventItem.id)
         .map((tier) => `${tier.tierName} (${tier.tierCode}) - ETB ${tier.price}`)
         .join(", ");
-      return `${eventItem.name}\nEventID: ${eventItem.id}\nTiers: ${tiersForEvent || "none"}`;
+      const feat = eventItem.featured ? "[Featured] " : "";
+      return `${feat}${eventItem.name}\nEventID: ${eventItem.id}\nTiers: ${tiersForEvent || "none"}`;
     });
     await ctx.reply(lines.join("\n\n"));
   });
@@ -1221,7 +1313,7 @@ if (config.telegramUserBotToken) {
   userBot.command("buy", async (ctx) => {
     const activeEvents = await db.query.events.findMany({
       where: inArray(events.status, ["published"]),
-      orderBy: [desc(events.startsAt)]
+      orderBy: [desc(events.featured), desc(events.startsAt)]
     });
     if (!activeEvents.length) {
       await ctx.reply("No published events found.");
@@ -1236,7 +1328,8 @@ if (config.telegramUserBotToken) {
         .filter((tier) => tier.eventId === eventItem.id)
         .map((tier) => `${tier.tierName} (${tier.tierCode}) - ETB ${tier.price}`)
         .join(", ");
-      return `${eventItem.name}\nEventID: ${eventItem.id}\nTiers: ${tiersForEvent || "none"}`;
+      const feat = eventItem.featured ? "[Featured] " : "";
+      return `${feat}${eventItem.name}\nEventID: ${eventItem.id}\nTiers: ${tiersForEvent || "none"}`;
     });
     await ctx.reply(lines.join("\n\n"));
   });

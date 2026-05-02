@@ -46,6 +46,7 @@ export const events = pgTable("events", {
   startsAt: timestamp("starts_at", { withTimezone: true }).notNull(),
   endsAt: timestamp("ends_at", { withTimezone: true }).notNull(),
   category: varchar("category", { length: 40 }).default("Music").notNull(),
+  featured: boolean("featured").default(false).notNull(),
   status: eventStatusEnum("status").default("draft").notNull(),
   createdAt: now,
   updatedAt

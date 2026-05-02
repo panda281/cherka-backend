@@ -1,7 +1,7 @@
 import express from "express";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, desc, eq } from "drizzle-orm";
 import { z } from "zod";
-import { EVENT_CATEGORIES, DEFAULT_EVENT_CATEGORY } from "../../constants/eventCategories";
+import { EVENT_CATEGORIES, DEFAULT_EVENT_CATEGORY, parseEventCategory } from "../../constants/eventCategories";
 import { db } from "../../db/client";
 import { eventTiers, events } from "../../db/schema";
 
@@ -12,6 +12,7 @@ const createEventSchema = z.object({
   description: z.string().optional(),
   location: z.string().optional(),
   category: z.enum(EVENT_CATEGORIES).optional(),
+  featured: z.boolean().optional(),
   eventImageUrl: z.string().url().optional(),
   ticketTemplateImageUrl: z.string().url().optional(),
   startsAt: z.string(),
@@ -34,6 +35,7 @@ eventsRouter.post("/admin/events", async (req, res) => {
     .values({
       ...data,
       category: data.category ?? DEFAULT_EVENT_CATEGORY,
+      featured: data.featured ?? false,
       startsAt: new Date(data.startsAt),
       endsAt: new Date(data.endsAt),
       status: data.status ?? "draft"
@@ -81,8 +83,19 @@ eventsRouter.patch("/admin/events/:eventId/tiers/:tierId", async (req, res) => {
   res.json(updated[0]);
 });
 
-eventsRouter.get("/events", async (_req, res) => {
-  const allEvents = await db.select().from(events).orderBy(asc(events.startsAt));
+eventsRouter.get("/events", async (req, res) => {
+  const rawCat = typeof req.query.category === "string" ? req.query.category.trim() : "";
+  const categoryFilter = rawCat && rawCat.toLowerCase() !== "all" ? parseEventCategory(rawCat) : null;
+  if (rawCat && rawCat.toLowerCase() !== "all" && !categoryFilter) {
+    res.status(400).json({ error: "Invalid category.", allowed: [...EVENT_CATEGORIES, "all"] });
+    return;
+  }
+
+  const allEvents = await db
+    .select()
+    .from(events)
+    .where(categoryFilter ? eq(events.category, categoryFilter) : undefined)
+    .orderBy(desc(events.featured), asc(events.startsAt));
   const tiers = await db.select().from(eventTiers).where(eq(eventTiers.active, true));
 
   const payload = allEvents.map((eventItem) => ({

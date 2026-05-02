@@ -29,6 +29,13 @@
       "when": 1777706417530,
       "tag": "0003_orders_telegram_user_id",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1777710942725,
+      "tag": "0004_events_featured",
+      "breakpoints": true
     }
   ]
 }
