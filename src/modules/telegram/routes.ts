@@ -39,6 +39,35 @@ function getArgs(text: string): string[] {
   return text.split(" ").slice(1).filter(Boolean);
 }
 
+/** Escape text for Telegram Bot API MarkdownV2 (outside pre/code). */
+function escapeMarkdownV2(text: string): string {
+  return text
+    .replace(/\\/g, "\\\\")
+    .replace(/_/g, "\\_")
+    .replace(/\*/g, "\\*")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]")
+    .replace(/\(/g, "\\(")
+    .replace(/\)/g, "\\)")
+    .replace(/~/g, "\\~")
+    .replace(/`/g, "\\`")
+    .replace(/>/g, "\\>")
+    .replace(/#/g, "\\#")
+    .replace(/\+/g, "\\+")
+    .replace(/-/g, "\\-")
+    .replace(/=/g, "\\=")
+    .replace(/\|/g, "\\|")
+    .replace(/\{/g, "\\{")
+    .replace(/\}/g, "\\}")
+    .replace(/\./g, "\\.")
+    .replace(/!/g, "\\!");
+}
+
+/** Escape payload inside MarkdownV2 inline `code` (only \\ and \\`). */
+function escapeMarkdownV2InlineCode(text: string): string {
+  return text.replace(/\\/g, "\\\\").replace(/`/g, "\\`");
+}
+
 const RECEIPT_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -1347,10 +1376,7 @@ if (config.telegramUserBotToken) {
           telegramUsername: ctx.from?.username
         });
         await replyWithIssuedTicket(ctx, deepRef, ticket);
-        await ctx.reply(
-          "Tip: share a deep link with ?start=" + deepRef + " so guests open the bot and get this QR in one step.",
-          userMenu
-        );
+        await ctx.reply("Your ticket QR is above.", userMenu);
         return;
       } catch (e) {
         await ctx.reply(e instanceof Error ? e.message : "Could not issue ticket yet.", userMenu);
@@ -1410,16 +1436,53 @@ if (config.telegramUserBotToken) {
 
   userBot.action("user_myticket", async (ctx) => {
     await ctx.answerCbQuery();
-    const list = await db.query.tickets.findMany({
-      where: eq(tickets.telegramUserId, String(ctx.from.id)),
-      orderBy: [desc(tickets.createdAt)],
-      limit: 5
-    });
-    if (!list.length) {
-      await ctx.reply("No tickets found.");
+    const tgId = String(ctx.from.id);
+    const rows = await db
+      .select({
+        eventName: events.name,
+        startsAt: events.startsAt,
+        endsAt: events.endsAt,
+        location: events.location,
+        tierCode: eventTiers.tierCode,
+        tierName: eventTiers.tierName,
+        orderRef: orders.orderRef,
+        ticketStatus: tickets.status,
+        usedAt: tickets.usedAt
+      })
+      .from(tickets)
+      .innerJoin(orders, eq(tickets.orderId, orders.id))
+      .innerJoin(events, eq(orders.eventId, events.id))
+      .innerJoin(eventTiers, eq(orders.tierId, eventTiers.id))
+      .where(eq(tickets.telegramUserId, tgId))
+      .orderBy(desc(tickets.createdAt))
+      .limit(15);
+    const replyOpts = { parse_mode: "MarkdownV2" as const, ...userMenu };
+    if (!rows.length) {
+      await ctx.reply(`_${escapeMarkdownV2("No tickets found.")}_`, replyOpts);
       return;
     }
-    await ctx.reply(list.map((item) => `ticketId=${item.id}\nstatus=${item.status}`).join("\n\n"));
+    const header =
+      `*${escapeMarkdownV2(`Your tickets (${rows.length})`)}*\n` +
+      `_${escapeMarkdownV2("Event · when · tier · order · status")}_\n`;
+    const lines = rows.map((r) => {
+      const start = r.startsAt.toISOString().replace("T", " ").slice(0, 16);
+      const end = r.endsAt.toISOString().replace("T", " ").slice(0, 16);
+      const rangeCode = `\`${escapeMarkdownV2InlineCode(`${start}–${end}`)}\``;
+      const loc = r.location ? ` · _${escapeMarkdownV2(r.location)}_` : "";
+      let extra = "";
+      if (r.ticketStatus === "used" && r.usedAt) {
+        const usedStr = r.usedAt.toISOString().replace("T", " ").slice(0, 16);
+        extra = `\n_${escapeMarkdownV2("Checked in:")}_ ${`\`${escapeMarkdownV2InlineCode(usedStr)}\``}`;
+      }
+      const tierCode = `\`${escapeMarkdownV2InlineCode(r.tierCode)}\``;
+      const orderRef = `\`${escapeMarkdownV2InlineCode(r.orderRef)}\``;
+      return (
+        `*${escapeMarkdownV2(r.eventName)}*${loc}\n` +
+        `${rangeCode}\n` +
+        `${escapeMarkdownV2(r.tierName)} \\(${tierCode}\\) · ${orderRef} · *${escapeMarkdownV2(r.ticketStatus)}*${extra}`
+      );
+    });
+    await ctx.reply(header + lines.join("\n\n"), replyOpts);
   });
 
   userBot.command("buy", async (ctx) => {
