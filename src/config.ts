@@ -37,5 +37,14 @@ export const config = {
   /** Scanner web login JWT lifetime (same secret as tickets but different payload shape) */
   scannerSessionDays: Number(process.env.SCANNER_SESSION_DAYS ?? "3"),
   /** t.me/+… or https://t.me/… — sent in a DM after successful check-in (requires TELEGRAM_USER_BOT_TOKEN) */
-  ticketrCommunityChannelUrl: (process.env.TICKETR_COMMUNITY_CHANNEL_URL ?? "").trim()
+  ticketrCommunityChannelUrl: (process.env.TICKETR_COMMUNITY_CHANNEL_URL ?? "").trim(),
+  /**
+   * When an event becomes published, post to this channel (@username or numeric -100… id).
+   * The user bot must be added as an admin with “Post messages”. Optional — if empty, no post.
+   */
+  telegramEventsChannelChatId: (process.env.TELEGRAM_EVENTS_CHANNEL_CHAT_ID ?? "").trim(),
+  /** Bump when privacy text changes — users must tap accept again in the user bot. */
+  privacyPolicyVersion: (process.env.PRIVACY_POLICY_VERSION ?? "1").trim(),
+  /** Optional public URL shown in the user bot privacy flow. */
+  privacyPolicyUrl: (process.env.PRIVACY_POLICY_URL ?? "").trim()
 };

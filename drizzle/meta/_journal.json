@@ -57,6 +57,34 @@
       "when": 1777724756028,
       "tag": "0007_famous_living_mummy",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1777758071728,
+      "tag": "0008_audit_receipt_released",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1777758686054,
+      "tag": "0009_ticket_sale_ledger",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1777759251749,
+      "tag": "0010_pricing_promo_roles_privacy",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1777760656133,
+      "tag": "0011_scanner_staff_audit_checkins",
+      "breakpoints": true
     }
   ]
 }

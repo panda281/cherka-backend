@@ -1,17 +1,38 @@
 import express from "express";
-import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import bcrypt from "bcryptjs";
+import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { Markup, Telegraf } from "telegraf";
 import type { Context } from "telegraf";
 import { config } from "../../config";
 import { DEFAULT_EVENT_CATEGORY, EVENT_CATEGORIES, parseEventCategory } from "../../constants/eventCategories";
 import { db } from "../../db/client";
-import { eventTiers, events, orders, receiptSubmissions, tickets } from "../../db/schema";
+import {
+  auditLogs,
+  eventTiers,
+  events,
+  orders,
+  privacyAcceptances,
+  receiptSubmissions,
+  scannerUsers,
+  tickets
+} from "../../db/schema";
+import type { ScannerRole } from "../scanner/scanAuth";
+import { auditScannerUserAdmin } from "../scanner/scannerStaffAudit";
+import { getScannerUserScanStats } from "../scanner/scannerUserStats";
+import { effectiveUnitPriceEtb } from "../pricing/effectiveUnitPrice";
 import { buildReceiptUrl } from "../../utils";
 import { approveReceiptSubmission } from "../receipts/approveSubmission";
+import { releaseReceiptSubmissionForResubmit } from "../receipts/releaseSubmission";
 import { reverifyReceiptWithTelebirrApi } from "../receipts/reverifySubmission";
 import { logReceiptVerify } from "../receipts/verifyLogging";
 import { resolveReceiptVerification } from "../receipts/verifier";
 import { issueTicketsForApprovedOrder } from "../tickets/service";
+import { pushAllTicketQrsForOrder } from "./ticketPhotoDelivery";
+import {
+  announcePublishedEventToChannel,
+  scheduleChannelAnnounceWhenNewlyPublished
+} from "./announceEventChannel";
+import { getEventTicketSalesReport } from "../events/salesReport";
 
 export const telegramRouter = express.Router();
 
@@ -84,7 +105,14 @@ function formatBrowseEventBlock(
     category: string;
     featured: boolean;
   },
-  tiersForEvent: { tierName: string; tierCode: string; price: string }[]
+  tiersForEvent: {
+    tierName: string;
+    tierCode: string;
+    price: string;
+    earlyBirdPrice: string | null;
+    earlyBirdEndsAt: Date | null;
+  }[],
+  at: Date = new Date()
 ): string {
   const title = eventItem.featured
     ? `✨ *${escapeMarkdownV2(eventItem.name)}*`
@@ -99,9 +127,20 @@ function formatBrowseEventBlock(
       ? escapeMarkdownV2("No tiers available.")
       : tiersForEvent
           .map((tier) => {
-            const priceStr = escapeMarkdownV2(String(tier.price));
+            const eff = effectiveUnitPriceEtb(tier, at);
+            const reg = Number(tier.price);
             const code = `\`${escapeMarkdownV2InlineCode(tier.tierCode)}\``;
-            return `• ${escapeMarkdownV2(tier.tierName)} \\(${code}\\) · ETB ${priceStr}`;
+            const earlyOn =
+              tier.earlyBirdEndsAt != null &&
+              tier.earlyBirdPrice != null &&
+              at.getTime() < tier.earlyBirdEndsAt.getTime() &&
+              eff < reg - 1e-9;
+            const priceStr = escapeMarkdownV2(eff.toFixed(2));
+            const until = tier.earlyBirdEndsAt!.toISOString().replace("T", " ").slice(0, 16);
+            const suffix = earlyOn
+              ? ` \\(${escapeMarkdownV2("early bird")} ${escapeMarkdownV2("until")} ${`\`${escapeMarkdownV2InlineCode(until)}\``}\\, ${escapeMarkdownV2("then")} ETB ${escapeMarkdownV2(reg.toFixed(2))}\\)`
+              : "";
+            return `• ${escapeMarkdownV2(tier.tierName)} \\(${code}\\) · ETB ${priceStr}${suffix}`;
           })
           .join("\n");
   const idCode = `\`${escapeMarkdownV2InlineCode(eventItem.id)}\``;
@@ -115,7 +154,42 @@ function formatBrowseEventBlock(
   );
 }
 
+async function privacyAcceptedForUserBot(tgId: string): Promise<boolean> {
+  const row = await db.query.privacyAcceptances.findFirst({
+    where: eq(privacyAcceptances.telegramUserId, tgId)
+  });
+  return row != null && row.policyVersion === config.privacyPolicyVersion;
+}
+
+async function replyUserBotPrivacyGate(ctx: Context): Promise<void> {
+  const lines = [
+    "Before you browse events, pay, or link tickets to this bot, please confirm you understand what we store.",
+    "",
+    "We process: your Telegram user ID; order references; Telebirr receipt references and verification notes;",
+    "ticket QR records and check-in events; and append-only sales ledger lines (amounts, tier, event snapshots).",
+    "Retention follows operational and legal needs for the organizer; contact them for deletion requests where applicable.",
+    ""
+  ];
+  if (config.privacyPolicyUrl) {
+    lines.push(`Full policy: ${config.privacyPolicyUrl}`, "");
+  }
+  lines.push(`Policy version: ${config.privacyPolicyVersion}`, "", 'Tap “I accept” to continue.');
+  await ctx.reply(
+    lines.join("\n"),
+    Markup.inlineKeyboard([[Markup.button.callback("I accept", telegramCallbackData("p_ok"))]])
+  );
+}
+
 async function replyPublishedEventsBrowse(ctx: Context): Promise<void> {
+  const uid = ctx.from?.id;
+  if (uid == null) {
+    await ctx.reply("Could not resolve your Telegram account.");
+    return;
+  }
+  if (!(await privacyAcceptedForUserBot(String(uid)))) {
+    await replyUserBotPrivacyGate(ctx);
+    return;
+  }
   const activeEvents = await db.query.events.findMany({
     where: inArray(events.status, ["published"]),
     orderBy: [desc(events.featured), desc(events.startsAt)]
@@ -173,6 +247,10 @@ async function replyMyTicketsPage(ctx: Context): Promise<void> {
     return;
   }
   const tgId = String(from.id);
+  if (!(await privacyAcceptedForUserBot(tgId))) {
+    await replyUserBotPrivacyGate(ctx);
+    return;
+  }
   const rows = await db
     .select({
       eventName: events.name,
@@ -242,7 +320,9 @@ const TIER_FIELD_BY_CODE: Record<string, AdminTierEditState["field"]> = {
   c: "tierCode",
   n: "tierName",
   p: "price",
-  k: "capacity"
+  k: "capacity",
+  b: "earlyBirdPrice",
+  w: "earlyBirdEndsAt"
 };
 
 const EVENT_FIELD_BY_CODE: Record<string, AdminEditState["field"]> = {
@@ -276,6 +356,8 @@ type TierDraft = {
   tierName: string;
   price: number;
   capacity: number | null;
+  earlyBirdPrice?: number;
+  earlyBirdEndsAt?: string;
 };
 
 type AdminCreateState = {
@@ -294,6 +376,8 @@ type AdminCreateState = {
     | "tierCode"
     | "tierName"
     | "tierPrice"
+    | "earlyBirdPrice"
+    | "earlyBirdEnds"
     | "tierCapacity"
     | "confirm";
   name?: string;
@@ -312,7 +396,7 @@ type AdminCreateState = {
 const adminCreateState = new Map<string, AdminCreateState>();
 type AdminTierAddState = {
   eventId: string;
-  step: "tierCode" | "tierName" | "tierPrice" | "tierCapacity";
+  step: "tierCode" | "tierName" | "tierPrice" | "earlyBirdPrice" | "earlyBirdEnds" | "tierCapacity";
   draftTier: Partial<TierDraft>;
 };
 type AdminEditState = {
@@ -333,12 +417,19 @@ type AdminEditState = {
 type AdminTierEditState = {
   eventId: string;
   tierId: string;
-  field: "tierCode" | "tierName" | "price" | "capacity";
+  field: "tierCode" | "tierName" | "price" | "capacity" | "earlyBirdPrice" | "earlyBirdEndsAt";
   step: "value";
 };
 const adminTierAddState = new Map<string, AdminTierAddState>();
 const adminEditState = new Map<string, AdminEditState>();
 const adminTierEditState = new Map<string, AdminTierEditState>();
+
+type AdminScannerUserAddState = {
+  step: "username" | "password" | "rolePick";
+  username?: string;
+  password?: string;
+};
+const adminScannerUserAddState = new Map<string, AdminScannerUserAddState>();
 
 if (config.telegramAdminBotToken) {
   adminBot = new Telegraf(config.telegramAdminBotToken);
@@ -369,7 +460,12 @@ if (config.telegramAdminBotToken) {
       ? tiers
           .map((tier) => {
             const sold = soldMap.get(tier.id) ?? 0;
-            return `- ${tier.tierName} (${tier.tierCode}) ETB ${tier.price} | sold ${sold} | ${tier.active ? "active" : "inactive"}`;
+            const eff = effectiveUnitPriceEtb(tier);
+            const eb =
+              tier.earlyBirdPrice != null && tier.earlyBirdEndsAt != null
+                ? ` early ${tier.earlyBirdPrice} until ${tier.earlyBirdEndsAt.toISOString().slice(0, 16)} →`
+                : "";
+            return `- ${tier.tierName} (${tier.tierCode})${eb} list ETB ${tier.price} · now ETB ${eff.toFixed(2)} | sold ${sold} | ${tier.active ? "active" : "inactive"}`;
           })
           .join("\n")
       : "No tiers configured.";
@@ -407,6 +503,7 @@ if (config.telegramAdminBotToken) {
           Markup.button.callback("Edit Event", telegramCallbackData(`eem:${eventId}`))
         ],
         [Markup.button.callback("Ticket holders", telegramCallbackData(`sls:${eventId}`))],
+        [Markup.button.callback("Post to channel again", telegramCallbackData(`e_pch:${eventId}`))],
         ...tierButtons,
         [Markup.button.callback("Back to Event List", telegramCallbackData("lst"))]
       ])
@@ -511,9 +608,108 @@ if (config.telegramAdminBotToken) {
     );
   }
 
+  async function sendScannerStaffList(chatId: number): Promise<void> {
+    const rows = await db.query.scannerUsers.findMany({
+      orderBy: [asc(scannerUsers.username)],
+      limit: 25,
+      columns: { id: true, username: true, role: true, active: true }
+    });
+    if (!rows.length) {
+      await adminBot!.telegram.sendMessage(
+        chatId,
+        "No scanner staff yet. Tap “Add scanner user”.",
+        Markup.inlineKeyboard([
+          [Markup.button.callback("Add scanner user", telegramCallbackData("su_n"))],
+          [Markup.button.callback("Back to menu", telegramCallbackData("adm"))]
+        ])
+      );
+      return;
+    }
+    const lines = rows.map(
+      (r) => `${r.active ? "●" : "○"} ${r.username} · ${r.role}${r.active ? "" : " (disabled)"}`
+    );
+    const buttons = rows.map((r) => [
+      Markup.button.callback(
+        `${r.active ? "" : "[off] "}${r.username}`.slice(0, 58),
+        telegramCallbackData(`su_v:${r.id}`)
+      )
+    ]);
+    await adminBot!.telegram.sendMessage(
+      chatId,
+      `Scanner staff (${rows.length})\n${lines.join("\n")}`,
+      Markup.inlineKeyboard([
+        ...buttons,
+        [
+          Markup.button.callback("Add scanner user", telegramCallbackData("su_n")),
+          Markup.button.callback("Back to menu", telegramCallbackData("adm"))
+        ]
+      ])
+    );
+  }
+
+  async function sendScannerUserDetail(chatId: number, userId: string): Promise<void> {
+    const user = await db.query.scannerUsers.findFirst({
+      where: eq(scannerUsers.id, userId),
+      columns: { id: true, username: true, role: true, active: true, createdAt: true }
+    });
+    if (!user) {
+      await adminBot!.telegram.sendMessage(chatId, "Scanner user not found.");
+      return;
+    }
+    const scans = await getScannerUserScanStats(userId);
+    const recent = await db.query.auditLogs.findMany({
+      where: and(eq(auditLogs.entityType, "scanner_user"), eq(auditLogs.entityId, userId)),
+      orderBy: [desc(auditLogs.createdAt)],
+      limit: 8
+    });
+    const auditLines =
+      recent.length === 0
+        ? "(no admin history yet)"
+        : recent
+            .map(
+              (a) =>
+                `${a.createdAt.toISOString().replace("T", " ").slice(0, 16)} · ${a.action} · ${a.actor}`
+            )
+            .join("\n");
+    const body = [
+      `Scanner: ${user.username}`,
+      `Role: ${user.role} · ${user.active ? "active" : "DISABLED"}`,
+      `Created: ${user.createdAt.toISOString()}`,
+      "",
+      "Check-ins (this login identity):",
+      `· Valid (guests admitted): ${scans.valid}`,
+      `· Already used: ${scans.alreadyUsed}`,
+      `· Invalid QR: ${scans.invalid}`,
+      `· Total attempts: ${scans.total}`,
+      "",
+      "Recent admin actions:",
+      auditLines
+    ].join("\n");
+    const row1 = user.active
+      ? [Markup.button.callback("Disable", telegramCallbackData(`su_d:${userId}`))]
+      : [Markup.button.callback("Enable", telegramCallbackData(`su_e:${userId}`))];
+    await adminBot!.telegram.sendMessage(
+      chatId,
+      body,
+      Markup.inlineKeyboard([
+        row1,
+        [
+          Markup.button.callback("Role: gate", telegramCallbackData(`su_rg:${userId}`)),
+          Markup.button.callback("finance", telegramCallbackData(`su_rf:${userId}`))
+        ],
+        [Markup.button.callback("Role: organizer_admin", telegramCallbackData(`su_ro:${userId}`))],
+        [
+          Markup.button.callback("Refresh stats", telegramCallbackData(`su_s:${userId}`)),
+          Markup.button.callback("Staff list", telegramCallbackData("su_l"))
+        ]
+      ])
+    );
+  }
+
   const adminMenu = Markup.inlineKeyboard([
     [Markup.button.callback("Create New Event", telegramCallbackData("nw"))],
     [Markup.button.callback("Event List", telegramCallbackData("lst"))],
+    [Markup.button.callback("Scanner staff", telegramCallbackData("su_l"))],
     [Markup.button.callback("View Verify Queue", telegramCallbackData("vq"))],
     [Markup.button.callback("Show Commands", telegramCallbackData("cmd"))]
   ]);
@@ -581,6 +777,10 @@ if (config.telegramAdminBotToken) {
     const eventId = ctx.match[1];
     const code = ctx.match[2];
     const status = code === "pub" ? "published" : code === "clo" ? "closed" : "draft";
+    const prev = await db.query.events.findFirst({
+      where: eq(events.id, eventId),
+      columns: { status: true }
+    });
     const [row] = await db.update(events).set({ status, updatedAt: new Date() }).where(eq(events.id, eventId)).returning();
     if (!row) {
       await ctx.answerCbQuery("Event not found");
@@ -588,6 +788,32 @@ if (config.telegramAdminBotToken) {
     }
     await ctx.answerCbQuery(`Set to ${status}`);
     await sendEventDetail(ctx.chat!.id, eventId);
+    if (status === "published" && prev?.status !== "published") {
+      scheduleChannelAnnounceWhenNewlyPublished(eventId, prev?.status);
+    }
+  });
+
+  adminBot.action(new RegExp(`^e_pch:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    const eventId = ctx.match[1];
+    const result = await announcePublishedEventToChannel(eventId);
+    if (!result.ok) {
+      const msg =
+        result.error === "skipped_no_config"
+          ? "Channel posting is not configured. Set TELEGRAM_EVENTS_CHANNEL_CHAT_ID (and TELEGRAM_USER_BOT_TOKEN); the user bot must be a channel admin."
+          : result.error === "not_published"
+            ? "Only published events can be posted. Publish the event first."
+            : `Could not post: ${result.error}`;
+      await ctx.reply(msg);
+      return;
+    }
+    await ctx.reply(
+      `Posted to the events channel again for event ${eventId}${result.messageId != null ? ` (message_id ${result.messageId})` : ""}.`
+    );
   });
 
   adminBot.action(new RegExp(`^sls:${CB_UUID}$`), async (ctx) => {
@@ -660,12 +886,16 @@ if (config.telegramAdminBotToken) {
           Markup.button.callback("Price", telegramCallbackData(`t_f:${tierId}:p`)),
           Markup.button.callback("Capacity", telegramCallbackData(`t_f:${tierId}:k`))
         ],
+        [
+          Markup.button.callback("Early $", telegramCallbackData(`t_f:${tierId}:b`)),
+          Markup.button.callback("Early end", telegramCallbackData(`t_f:${tierId}:w`))
+        ],
         [Markup.button.callback("Back", telegramCallbackData(`evd:${eventId}`))]
       ])
     );
   });
 
-  adminBot.action(new RegExp(`^t_f:${CB_UUID}:([cnkp])$`), async (ctx) => {
+  adminBot.action(new RegExp(`^t_f:${CB_UUID}:([cnkpbw])$`), async (ctx) => {
     if (!isAdminUser(String(ctx.from.id))) {
       await ctx.answerCbQuery("Unauthorized");
       return;
@@ -691,7 +921,15 @@ if (config.telegramAdminBotToken) {
       field,
       step: "value"
     });
-    await ctx.reply(`Send new value for ${field}. For capacity you can send skip for unlimited.`);
+    const hint =
+      field === "capacity"
+        ? " For capacity you can send skip for unlimited."
+        : field === "earlyBirdEndsAt"
+          ? " Send ISO datetime (e.g. 2026-06-01T17:00:00Z) or skip to clear."
+          : field === "earlyBirdPrice"
+            ? " Send ETB amount or skip to clear early bird."
+            : "";
+    await ctx.reply(`Send new value for ${field}.${hint}`);
   });
 
   adminBot.action(new RegExp(`^eem:${CB_UUID}$`), async (ctx) => {
@@ -778,7 +1016,9 @@ if (config.telegramAdminBotToken) {
     const text = [
       ...queue.map((item) => `receiptId=${item.id}\norderId=${item.orderId}\nreceiptNo=${item.receiptNo}`),
       "",
-      "Re-run Telebirr on one: /reverify <receiptId>"
+      "Re-run Telebirr on one: /reverify <receiptId>",
+      "",
+      "Wrong receipt locked the number? After /reject, use /releasereceipt <receiptId> to free it (or for verifying-only mistakes)."
     ].join("\n");
     await ctx.reply(text);
   });
@@ -790,8 +1030,230 @@ if (config.telegramAdminBotToken) {
     }
     await ctx.answerCbQuery();
     await ctx.reply(
-      "Commands:\n/adminmenu\n/newevent name|…|category(optional)|featured yes/no(optional)\nEvent List: category filter buttons — open an event to Publish / Close sales / Draft\n/addtier eventId|…\n/verifyqueue\n/approve /reject /reverify …"
+      "Commands:\n/adminmenu\n/newevent name|…|category(optional)|featured yes/no(optional)\nEvent List: category filter buttons — open an event to Publish / Close sales / Draft\nWhen an event becomes published, it can auto-post to your channel (set TELEGRAM_EVENTS_CHANNEL_CHAT_ID; user bot must be channel admin). From an event’s detail screen you can also tap “Post to channel again”.\n/addtier eventId|…\n/resendtickets ORDER_REF — resend all QR images to buyer (admin only)\n/verifyqueue\n/approve /reject /reverify /releasereceipt /eventsales …\nScanner staff: admin menu button — add/disable/enable gate logins, roles, scan counts & audit history."
     );
+  });
+
+  adminBot.action("adm", async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    await ctx.reply("Admin quick actions:", adminMenu);
+  });
+
+  adminBot.action("su_l", async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    await sendScannerStaffList(ctx.chat!.id);
+  });
+
+  adminBot.action("su_n", async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    adminScannerUserAddState.set(String(ctx.from.id), { step: "username" });
+    await ctx.reply("New scanner user — send login username (lowercase, 2–64 chars: a-z 0-9 _ -). /cancel to abort.");
+  });
+
+  adminBot.action(new RegExp(`^su_v:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    await sendScannerUserDetail(ctx.chat!.id, ctx.match![1]!);
+  });
+
+  adminBot.action(new RegExp(`^su_s:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    const userId = ctx.match![1]!;
+    const scans = await getScannerUserScanStats(userId);
+    await ctx.reply(
+      `Scan totals for this account:\n· Valid: ${scans.valid}\n· Already used: ${scans.alreadyUsed}\n· Invalid: ${scans.invalid}\n· Total: ${scans.total}\n\n(Counts use check-ins after this update; API-key scans are not tied to a user.)`
+    );
+  });
+
+  adminBot.action(new RegExp(`^su_d:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    const userId = ctx.match![1]!;
+    const actor = `admin_tg:${ctx.from?.id ?? "?"}`;
+    const existing = await db.query.scannerUsers.findFirst({ where: eq(scannerUsers.id, userId) });
+    if (!existing) {
+      await ctx.answerCbQuery("Not found");
+      return;
+    }
+    if (!existing.active) {
+      await ctx.answerCbQuery("Already disabled");
+      return;
+    }
+    await db.update(scannerUsers).set({ active: false, updatedAt: new Date() }).where(eq(scannerUsers.id, userId));
+    await auditScannerUserAdmin({
+      action: "scanner_user_disabled",
+      scannerUserId: userId,
+      actorLabel: actor,
+      metadata: { username: existing.username, channel: "telegram_admin" }
+    });
+    await ctx.answerCbQuery("Disabled");
+    await sendScannerUserDetail(ctx.chat!.id, userId);
+  });
+
+  adminBot.action(new RegExp(`^su_e:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    const userId = ctx.match![1]!;
+    const actor = `admin_tg:${ctx.from?.id ?? "?"}`;
+    const existing = await db.query.scannerUsers.findFirst({ where: eq(scannerUsers.id, userId) });
+    if (!existing) {
+      await ctx.answerCbQuery("Not found");
+      return;
+    }
+    if (existing.active) {
+      await ctx.answerCbQuery("Already active");
+      return;
+    }
+    await db.update(scannerUsers).set({ active: true, updatedAt: new Date() }).where(eq(scannerUsers.id, userId));
+    await auditScannerUserAdmin({
+      action: "scanner_user_enabled",
+      scannerUserId: userId,
+      actorLabel: actor,
+      metadata: { username: existing.username, channel: "telegram_admin" }
+    });
+    await ctx.answerCbQuery("Enabled");
+    await sendScannerUserDetail(ctx.chat!.id, userId);
+  });
+
+  async function setScannerUserRoleTelegram(userId: string, role: ScannerRole, ctx: Context): Promise<void> {
+    const actor = `admin_tg:${ctx.from?.id ?? "?"}`;
+    const existing = await db.query.scannerUsers.findFirst({ where: eq(scannerUsers.id, userId) });
+    if (!existing) {
+      await ctx.answerCbQuery("Not found");
+      return;
+    }
+    if (existing.role === role) {
+      await ctx.answerCbQuery("Role unchanged");
+      return;
+    }
+    await db.update(scannerUsers).set({ role, updatedAt: new Date() }).where(eq(scannerUsers.id, userId));
+    await auditScannerUserAdmin({
+      action: "scanner_user_role_changed",
+      scannerUserId: userId,
+      actorLabel: actor,
+      metadata: {
+        username: existing.username,
+        from: existing.role,
+        to: role,
+        channel: "telegram_admin"
+      }
+    });
+    await ctx.answerCbQuery(`Role → ${role}`);
+    await sendScannerUserDetail(ctx.chat!.id, userId);
+  }
+
+  adminBot.action(new RegExp(`^su_rg:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await setScannerUserRoleTelegram(ctx.match![1]!, "gate", ctx);
+  });
+
+  adminBot.action(new RegExp(`^su_rf:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await setScannerUserRoleTelegram(ctx.match![1]!, "finance", ctx);
+  });
+
+  adminBot.action(new RegExp(`^su_ro:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await setScannerUserRoleTelegram(ctx.match![1]!, "organizer_admin", ctx);
+  });
+
+  adminBot.action(/^su_cr:([gfo])$/, async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    const st = adminScannerUserAddState.get(String(ctx.from.id));
+    if (!st || st.step !== "rolePick" || !st.username || !st.password) {
+      await ctx.answerCbQuery("Start from Scanner staff → Add user");
+      return;
+    }
+    const code = ctx.match![1] as "g" | "f" | "o";
+    const role: ScannerRole = code === "g" ? "gate" : code === "f" ? "finance" : "organizer_admin";
+    const passwordHash = await bcrypt.hash(st.password, 12);
+    const actor = `admin_tg:${ctx.from?.id ?? "?"}`;
+    try {
+      const [row] = await db
+        .insert(scannerUsers)
+        .values({ username: st.username, passwordHash, role, active: true })
+        .returning({ id: scannerUsers.id, username: scannerUsers.username });
+      adminScannerUserAddState.delete(String(ctx.from.id));
+      await auditScannerUserAdmin({
+        action: "scanner_user_created",
+        scannerUserId: row.id,
+        actorLabel: actor,
+        metadata: { username: row.username, role, channel: "telegram_admin" }
+      });
+      await ctx.answerCbQuery("Created");
+      await ctx.reply(`Scanner user created: ${row.username} (${role}).`);
+      await sendScannerUserDetail(ctx.chat!.id, row.id);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      await ctx.answerCbQuery(msg.includes("unique") ? "Username taken" : "Failed");
+      if (msg.includes("unique") || msg.includes("duplicate")) {
+        await ctx.reply("That username is already taken. /cancel then Add scanner user again.");
+      }
+      adminScannerUserAddState.delete(String(ctx.from.id));
+    }
+  });
+
+  adminBot.command("resendtickets", async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.reply("Unauthorized.");
+      return;
+    }
+    const args = getArgs(getText(ctx));
+    const orderRef = args[0]?.trim();
+    if (!orderRef) {
+      await ctx.reply(
+        "Usage: /resendtickets ORDER_REF\n\nSends every ticket QR image again to the buyer’s linked Telegram (same codes as before). Use when delivery failed or the guest lost the chat."
+      );
+      return;
+    }
+    const result = await pushAllTicketQrsForOrder({
+      orderRef,
+      actorLabel: `admin_tg:${ctx.from?.id ?? "?"}`
+    });
+    if (!result.ok) {
+      await ctx.reply(`Could not resend: ${result.error}`);
+      return;
+    }
+    let msg = `Sent ${result.pushed}/${result.total} ticket QR(s) to the buyer for ${result.orderRef}.`;
+    if (result.warning) {
+      msg += `\n\n${result.warning}`;
+    }
+    await ctx.reply(msg);
   });
 
   adminBot.command("eventlist", async (ctx) => {
@@ -849,6 +1311,7 @@ if (config.telegramAdminBotToken) {
       })
       .returning();
     await ctx.reply(`Event created: ${created.name}\nID: ${created.id}`);
+    scheduleChannelAnnounceWhenNewlyPublished(created.id, undefined);
   });
 
   adminBot.command("cancel", async (ctx) => {
@@ -860,6 +1323,7 @@ if (config.telegramAdminBotToken) {
     adminTierAddState.delete(String(ctx.from.id));
     adminEditState.delete(String(ctx.from.id));
     adminTierEditState.delete(String(ctx.from.id));
+    adminScannerUserAddState.delete(String(ctx.from.id));
     await ctx.reply("Current wizard cancelled.");
   });
 
@@ -888,6 +1352,58 @@ if (config.telegramAdminBotToken) {
     await ctx.reply(`Tier added: ${created.tierName} (${created.tierCode}) for event ${created.eventId}`);
   });
 
+  adminBot.command("eventsales", async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.reply("Unauthorized.");
+      return;
+    }
+    const args = getArgs(getText(ctx));
+    const raw = args[0]?.trim() ?? "";
+    const eventId = RECEIPT_UUID_RE.test(raw) ? raw : null;
+    if (!eventId) {
+      await ctx.reply(
+        "Usage: /eventsales EVENT_UUID\n\nSummary from immutable sales ledger. Event List → event details for the id.\nExports: GET /admin/events/:eventId/sales-ledger (JSON) or …/sales-ledger.csv"
+      );
+      return;
+    }
+    const report = await getEventTicketSalesReport(eventId, 15);
+    if (!report) {
+      await ctx.reply("Event not found.");
+      return;
+    }
+    const { summary, ticketLines } = report;
+    const tierLines =
+      summary.byTier.length > 0
+        ? summary.byTier
+            .map(
+              (t) =>
+                `${t.tierCode}: ${t.ticketsSold} sold · ETB ${t.revenueEtb} (list ${t.listPriceEtb})`
+            )
+            .join("\n")
+        : "(no tickets issued yet)";
+    const parts = [
+      `Sales — ${report.event.name}`,
+      `Total tickets: ${summary.totalTicketsIssued} · Revenue: ETB ${summary.totalRevenueEtb}`,
+      "",
+      tierLines
+    ];
+    if (ticketLines?.length) {
+      parts.push(
+        "",
+        "Recent tickets:",
+        ...ticketLines.map(
+          (r) =>
+            `${r.orderRef} · ${r.tierCode} · ${
+              r.buyerUsername && r.buyerUsername.length > 0
+                ? `@${r.buyerUsername.replace(/^@/, "")}`
+                : r.buyerTelegramId
+            } · ${r.ticketStatus} · ETB ${r.revenueForThisTicketEtb}`
+        )
+      );
+    }
+    await ctx.reply(parts.join("\n"));
+  });
+
   adminBot.command("verifyqueue", async (ctx) => {
     if (!isAdminUser(String(ctx.from.id))) {
       await ctx.reply("Unauthorized.");
@@ -905,7 +1421,8 @@ if (config.telegramAdminBotToken) {
     const text = [
       ...queue.map((item) => `receiptId=${item.id}\norderId=${item.orderId}\nreceiptNo=${item.receiptNo}`),
       "",
-      "Re-run Telebirr on one: /reverify <receiptId>"
+      "Re-run Telebirr on one: /reverify <receiptId>",
+      "Wrong receipt number locking Telebirr? /releasereceipt <receiptId> (order must have no tickets)."
     ].join("\n");
     await ctx.reply(text);
   });
@@ -1031,10 +1548,85 @@ if (config.telegramAdminBotToken) {
     await ctx.reply(`Rejected receipt ${receiptId}`);
   });
 
+  adminBot.command("releasereceipt", async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.reply("Unauthorized.");
+      return;
+    }
+    const args = getArgs(getText(ctx));
+    const receiptId = parseReceiptIdArg(args[0]);
+    const notes = args.slice(1).join(" ").trim() || undefined;
+    if (!receiptId) {
+      await ctx.reply(
+        [
+          "Usage: /releasereceipt RECEIPT_UUID [note]",
+          "Deletes the submission row so the same Telebirr receipt number can be submitted again.",
+          "Order goes back to pending_receipt. Only for rejected or verifying — never if approved or tickets exist.",
+          "Example: /releasereceipt 64448a4a-... typo fixed"
+        ].join("\n")
+      );
+      return;
+    }
+    const result = await releaseReceiptSubmissionForResubmit({
+      receiptId,
+      actor: `admin_tg:${ctx.from?.id ?? "?"}`,
+      notes
+    });
+    if (!result.ok) {
+      await ctx.reply(`Cannot release: ${result.error}`);
+      return;
+    }
+    await ctx.reply(
+      `Released submission ${receiptId}. Receipt ${result.freedReceiptNo} is free to use again. Order reset to pending_receipt.`
+    );
+  });
+
   adminBot.on("text", async (ctx, next) => {
     if (!isAdminUser(String(ctx.from.id))) {
       await next();
       return;
+    }
+    const scannerAdd = adminScannerUserAddState.get(String(ctx.from.id));
+    if (scannerAdd) {
+      const text = getText(ctx).trim();
+      if (scannerAdd.step === "rolePick") {
+        await ctx.reply("Choose a role with the buttons, or /cancel.");
+        return;
+      }
+      if (!text) {
+        await ctx.reply("Send a value or /cancel.");
+        return;
+      }
+      if (scannerAdd.step === "username") {
+        const u = text.toLowerCase();
+        if (!/^[a-z0-9_-]{2,64}$/.test(u)) {
+          await ctx.reply("Use 2–64 characters: a-z 0-9 _ -");
+          return;
+        }
+        scannerAdd.username = u;
+        scannerAdd.step = "password";
+        await ctx.reply(
+          `Username: ${u}\nSend password (min 8 characters). Delete this chat message later if others can read it.`
+        );
+        return;
+      }
+      if (scannerAdd.step === "password") {
+        if (text.length < 8) {
+          await ctx.reply("Password must be at least 8 characters.");
+          return;
+        }
+        scannerAdd.password = text;
+        scannerAdd.step = "rolePick";
+        await ctx.reply(
+          "Choose role:",
+          Markup.inlineKeyboard([
+            [Markup.button.callback("gate (scan only)", "su_cr:g")],
+            [Markup.button.callback("finance (sales read)", "su_cr:f")],
+            [Markup.button.callback("organizer_admin", "su_cr:o")]
+          ])
+        );
+        return;
+      }
     }
     const state = adminCreateState.get(String(ctx.from.id));
     const tierState = adminTierAddState.get(String(ctx.from.id));
@@ -1070,8 +1662,36 @@ if (config.telegramAdminBotToken) {
           return;
         }
         tierState.draftTier.price = price;
+        tierState.step = "earlyBirdPrice";
+        await ctx.reply("Step D: early bird unit price (ETB), or type skip.");
+        return;
+      }
+      if (tierState.step === "earlyBirdPrice") {
+        if (text.toLowerCase() === "skip") {
+          delete tierState.draftTier.earlyBirdPrice;
+          delete tierState.draftTier.earlyBirdEndsAt;
+          tierState.step = "tierCapacity";
+          await ctx.reply("Step F: send capacity or type skip.");
+          return;
+        }
+        const ebp = Number(text);
+        if (Number.isNaN(ebp) || ebp <= 0) {
+          await ctx.reply("Invalid early bird price. Send a positive number or skip.");
+          return;
+        }
+        tierState.draftTier.earlyBirdPrice = ebp;
+        tierState.step = "earlyBirdEnds";
+        await ctx.reply("Step E: early bird ends at — send ISO datetime (e.g. 2026-06-01T17:00:00Z).");
+        return;
+      }
+      if (tierState.step === "earlyBirdEnds") {
+        if (Number.isNaN(Date.parse(text))) {
+          await ctx.reply("Invalid date. Send ISO datetime.");
+          return;
+        }
+        tierState.draftTier.earlyBirdEndsAt = text;
         tierState.step = "tierCapacity";
-        await ctx.reply("Step D: send capacity or type skip.");
+        await ctx.reply("Step F: send capacity or type skip.");
         return;
       }
       const capacity = text.toLowerCase() === "skip" ? null : Number(text);
@@ -1088,6 +1708,13 @@ if (config.telegramAdminBotToken) {
         tierCode: tierState.draftTier.tierCode,
         tierName: tierState.draftTier.tierName,
         price: tierState.draftTier.price.toFixed(2),
+        earlyBirdPrice:
+          tierState.draftTier.earlyBirdPrice != null
+            ? tierState.draftTier.earlyBirdPrice.toFixed(2)
+            : undefined,
+        earlyBirdEndsAt: tierState.draftTier.earlyBirdEndsAt
+          ? new Date(tierState.draftTier.earlyBirdEndsAt)
+          : undefined,
         capacity,
         active: true
       });
@@ -1153,10 +1780,17 @@ if (config.telegramAdminBotToken) {
       } else {
         patch[editState.field] = value;
       }
+      const prevRow = await db.query.events.findFirst({
+        where: eq(events.id, editState.eventId),
+        columns: { status: true }
+      });
       await db.update(events).set(patch).where(eq(events.id, editState.eventId));
       adminEditState.delete(String(ctx.from.id));
       await ctx.reply("Event updated.");
       await sendEventDetail(ctx.chat!.id, editState.eventId);
+      if (editState.field === "status" && statusNorm === "published" && prevRow?.status !== "published") {
+        scheduleChannelAnnounceWhenNewlyPublished(editState.eventId, prevRow?.status);
+      }
       return;
     }
 
@@ -1184,6 +1818,26 @@ if (config.telegramAdminBotToken) {
           return;
         }
         patch.capacity = cap;
+      } else if (tierEditState.field === "earlyBirdPrice") {
+        if (text.toLowerCase() === "skip") {
+          patch.earlyBirdPrice = null;
+        } else {
+          const ebp = Number(text);
+          if (Number.isNaN(ebp) || ebp <= 0) {
+            await ctx.reply("Invalid early bird price. Send a positive number or skip.");
+            return;
+          }
+          patch.earlyBirdPrice = ebp.toFixed(2);
+        }
+      } else if (tierEditState.field === "earlyBirdEndsAt") {
+        if (text.toLowerCase() === "skip") {
+          patch.earlyBirdEndsAt = null;
+        } else if (Number.isNaN(Date.parse(text))) {
+          await ctx.reply("Invalid date. Send ISO datetime or skip.");
+          return;
+        } else {
+          patch.earlyBirdEndsAt = new Date(text);
+        }
       } else if (tierEditState.field === "tierCode") {
         patch.tierCode = text.toLowerCase();
       } else {
@@ -1296,7 +1950,13 @@ if (config.telegramAdminBotToken) {
       }
       state.step = "confirm";
       const preview = `Preview:\nName: ${state.name}\nStart: ${state.startsAt}\nEnd: ${state.endsAt}\nLocation: ${state.location ?? "-"}\nDescription: ${state.description ?? "-"}\nCategory: ${state.category ?? DEFAULT_EVENT_CATEGORY}\nFeatured: ${state.featured ? "yes" : "no"}\nEvent image: ${state.eventImageUrl ?? "-"}\nTicket template image: ${state.ticketTemplateImageUrl ?? "-"}\nTiers:\n${state.tiers
-        .map((tier) => `- ${tier.tierName} (${tier.tierCode}) ETB ${tier.price} cap ${tier.capacity ?? "unlimited"}`)
+        .map((tier) => {
+          const eb =
+            tier.earlyBirdPrice != null && tier.earlyBirdEndsAt
+              ? ` early ${tier.earlyBirdPrice} until ${tier.earlyBirdEndsAt} ·`
+              : "";
+          return `- ${tier.tierName} (${tier.tierCode})${eb} door ETB ${tier.price} cap ${tier.capacity ?? "unlimited"}`;
+        })
         .join("\n")}`;
       await ctx.reply(preview);
       await ctx.reply("Step 11/12: type confirm to create event, or /cancel.");
@@ -1321,8 +1981,38 @@ if (config.telegramAdminBotToken) {
         return;
       }
       state.draftTier = { ...(state.draftTier ?? {}), price };
+      state.step = "earlyBirdPrice";
+      await ctx.reply("Tier step D: early bird unit price (ETB), or type skip.");
+      return;
+    }
+    if (state.step === "earlyBirdPrice") {
+      if (text.toLowerCase() === "skip") {
+        const d = { ...(state.draftTier ?? {}) };
+        delete d.earlyBirdPrice;
+        delete d.earlyBirdEndsAt;
+        state.draftTier = d;
+        state.step = "tierCapacity";
+        await ctx.reply("Tier step F: send capacity number, or type skip.");
+        return;
+      }
+      const ebp = Number(text);
+      if (Number.isNaN(ebp) || ebp <= 0) {
+        await ctx.reply("Invalid early bird price. Send a positive number or skip.");
+        return;
+      }
+      state.draftTier = { ...(state.draftTier ?? {}), earlyBirdPrice: ebp };
+      state.step = "earlyBirdEnds";
+      await ctx.reply("Tier step E: early bird ends at — send ISO datetime.");
+      return;
+    }
+    if (state.step === "earlyBirdEnds") {
+      if (Number.isNaN(Date.parse(text))) {
+        await ctx.reply("Invalid date. Send ISO datetime.");
+        return;
+      }
+      state.draftTier = { ...(state.draftTier ?? {}), earlyBirdEndsAt: text };
       state.step = "tierCapacity";
-      await ctx.reply("Tier step D: send capacity number, or type skip.");
+      await ctx.reply("Tier step F: send capacity number, or type skip.");
       return;
     }
     if (state.step === "tierCapacity") {
@@ -1381,6 +2071,9 @@ if (config.telegramAdminBotToken) {
             tierCode: tier.tierCode,
             tierName: tier.tierName,
             price: tier.price.toFixed(2),
+            earlyBirdPrice:
+              tier.earlyBirdPrice != null ? tier.earlyBirdPrice.toFixed(2) : undefined,
+            earlyBirdEndsAt: tier.earlyBirdEndsAt ? new Date(tier.earlyBirdEndsAt) : undefined,
             capacity: tier.capacity,
             active: true
           }))
@@ -1389,6 +2082,7 @@ if (config.telegramAdminBotToken) {
       });
       adminCreateState.delete(String(ctx.from.id));
       await ctx.reply(`Event created successfully.\nID: ${created.id}\nName: ${created.name}`);
+      scheduleChannelAnnounceWhenNewlyPublished(created.id, undefined);
       return;
     }
   });
@@ -1453,12 +2147,57 @@ if (config.telegramAdminBotToken) {
 if (config.telegramUserBotToken) {
   userBot = new Telegraf(config.telegramUserBotToken);
 
+  userBot.action("p_ok", async (ctx) => {
+    await ctx.answerCbQuery();
+    const from = ctx.from;
+    if (!from) return;
+    await db
+      .insert(privacyAcceptances)
+      .values({
+        telegramUserId: String(from.id),
+        policyVersion: config.privacyPolicyVersion,
+        acceptedAt: new Date()
+      })
+      .onConflictDoUpdate({
+        target: privacyAcceptances.telegramUserId,
+        set: {
+          policyVersion: config.privacyPolicyVersion,
+          acceptedAt: new Date()
+        }
+      });
+    await ctx.reply(
+      "Thank you. You can browse events, submit receipts, and claim tickets.",
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Browse Events", telegramCallbackData("user_buy"))],
+        [Markup.button.callback("Submit Receipt Help", telegramCallbackData("user_submit_help"))],
+        [Markup.button.callback("Claim Ticket Help", telegramCallbackData("user_claim_help"))],
+        [Markup.button.callback("My Tickets", telegramCallbackData("user_myticket"))]
+      ])
+    );
+  });
+
   const userMenu = Markup.inlineKeyboard([
     [Markup.button.callback("Browse Events", telegramCallbackData("user_buy"))],
     [Markup.button.callback("Submit Receipt Help", telegramCallbackData("user_submit_help"))],
     [Markup.button.callback("Claim Ticket Help", telegramCallbackData("user_claim_help"))],
     [Markup.button.callback("My Tickets", telegramCallbackData("user_myticket"))]
   ]);
+
+  async function replyPublishedSingleEventForBuy(ctx: Context, eventId: string): Promise<void> {
+    const eventItem = await db.query.events.findFirst({
+      where: and(eq(events.id, eventId), eq(events.status, "published"))
+    });
+    if (!eventItem) {
+      await ctx.reply("This event is not available for booking right now. Try /buy to see published events.", userMenu);
+      return;
+    }
+    const tierRows = await db.query.eventTiers.findMany({
+      where: and(eq(eventTiers.eventId, eventId), eq(eventTiers.active, true)),
+      orderBy: [eventTiers.tierName]
+    });
+    const block = formatBrowseEventBlock(eventItem, tierRows);
+    await ctx.reply(`*${escapeMarkdownV2("Book this event")}*\n\n${block}`, { parse_mode: "MarkdownV2" });
+  }
 
   function orderRefFromDeepLink(ctx: Context): string | undefined {
     const p = (ctx as Context & { startPayload?: string }).startPayload?.trim();
@@ -1477,13 +2216,14 @@ if (config.telegramUserBotToken) {
   async function replyWithIssuedTickets(
     ctx: Context,
     orderRef: string,
-    ticketRows: Awaited<ReturnType<typeof issueTicketsForApprovedOrder>>["newlyIssued"],
-    totalQty: number
+    ticketRows: Awaited<ReturnType<typeof issueTicketsForApprovedOrder>>["tickets"],
+    totalQty: number,
+    mode: "newOnly" | "allExisting" = "newOnly"
   ) {
     if (ticketRows.length === 0) {
       return;
     }
-    const baseIndex = totalQty - ticketRows.length;
+    const baseIndex = mode === "allExisting" ? 0 : totalQty - ticketRows.length;
     for (let i = 0; i < ticketRows.length; i++) {
       const ticket = ticketRows[i]!;
       const caption =
@@ -1570,8 +2310,26 @@ if (config.telegramUserBotToken) {
   }
 
   userBot.start(async (ctx) => {
-    const tgId = String(ctx.from?.id ?? "");
-    const deepRef = orderRefFromDeepLink(ctx);
+    if (!ctx.from) {
+      await ctx.reply("Could not resolve your Telegram account.");
+      return;
+    }
+    const tgId = String(ctx.from.id);
+    if (!(await privacyAcceptedForUserBot(tgId))) {
+      await replyUserBotPrivacyGate(ctx);
+      return;
+    }
+    const rawStart = orderRefFromDeepLink(ctx);
+    if (rawStart?.toLowerCase().startsWith("buy_")) {
+      const eventId = rawStart.slice(4).trim();
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(eventId)) {
+        await replyPublishedSingleEventForBuy(ctx, eventId);
+        return;
+      }
+      await ctx.reply("This event link is not valid. Try /buy to see current events.", userMenu);
+      return;
+    }
+    const deepRef = rawStart;
     if (deepRef) {
       await db.update(orders).set({ telegramUserId: tgId, updatedAt: new Date() }).where(eq(orders.orderRef, deepRef));
       try {
@@ -1599,7 +2357,15 @@ if (config.telegramUserBotToken) {
   });
 
   userBot.command("menu", async (ctx) => {
+    if (!ctx.from || !(await privacyAcceptedForUserBot(String(ctx.from.id)))) {
+      await replyUserBotPrivacyGate(ctx);
+      return;
+    }
     await ctx.reply("User quick actions:", userMenu);
+  });
+
+  userBot.command("privacy", async (ctx) => {
+    await replyUserBotPrivacyGate(ctx);
   });
 
   userBot.action("user_buy", async (ctx) => {
@@ -1614,7 +2380,9 @@ if (config.telegramUserBotToken) {
 
   userBot.action("user_claim_help", async (ctx) => {
     await ctx.answerCbQuery();
-    await ctx.reply("Use:\n/claim ORDER_REF\nExample:\n/claim ORD-ABCD12");
+    await ctx.reply(
+      "Use:\n/claim ORDER_REF\nExample:\n/claim ORD-ABCD12\n\nAfter approval, this sends your QR ticket image(s). Run it again if the photos never arrived. If it still fails, ask the organizer for help."
+    );
   });
 
   userBot.action("user_myticket", async (ctx) => {
@@ -1635,10 +2403,14 @@ if (config.telegramUserBotToken) {
   });
 
   userBot.command("submit", async (ctx) => {
+    if (!ctx.from || !(await privacyAcceptedForUserBot(String(ctx.from.id)))) {
+      await replyUserBotPrivacyGate(ctx);
+      return;
+    }
     const args = getArgs(getText(ctx));
-    const orderRef = args[0];
-    const receiptNo = args[1];
-    if (!orderRef || !receiptNo) {
+    const orderRef = args[0]?.trim();
+    const receiptNo = args[1]?.trim() ?? "";
+    if (!orderRef || receiptNo.length < 6) {
       await ctx.reply("Usage: /submit ORDER_REF RECEIPT_NO");
       return;
     }
@@ -1656,7 +2428,7 @@ if (config.telegramUserBotToken) {
     });
     if (existingReceipt) {
       await ctx.reply(
-        "This receipt number was already submitted. If that was a mistake, contact support with a different receipt."
+        "This Telebirr receipt was already used. Each receipt can only be submitted once — you cannot reuse it for another order after getting a ticket (or while it is tied to an existing submission)."
       );
       return;
     }
@@ -1723,6 +2495,7 @@ if (config.telegramUserBotToken) {
         await ctx.reply(
           [
             "Receipt auto-verified, but the QR could not be issued yet. Try: /claim " + orderRef,
+            "If that still fails, ask an organizer to run /resendtickets " + orderRef + " from the admin bot.",
             "",
             verifyResult.notes
           ].join("\n")
@@ -1749,6 +2522,10 @@ if (config.telegramUserBotToken) {
   });
 
   userBot.command("status", async (ctx) => {
+    if (!ctx.from || !(await privacyAcceptedForUserBot(String(ctx.from.id)))) {
+      await replyUserBotPrivacyGate(ctx);
+      return;
+    }
     const args = getArgs(getText(ctx));
     const orderRef = args[0];
     if (!orderRef) {
@@ -1778,17 +2555,23 @@ if (config.telegramUserBotToken) {
         receiptLine,
         "",
         order.status === "approved" || order.status === "ticket_issued"
-          ? "You can claim your ticket QR codes: /claim " + orderRef
+          ? "Get your ticket QR images in this chat: /claim " +
+            orderRef +
+            " (you can run it again if photos did not arrive)."
           : order.status === "verifying"
             ? "Waiting for admin to verify your receipt. Try again later with /status"
             : order.status === "rejected"
-              ? "This order was rejected. Contact the organizer if you believe this is wrong."
+              ? "This order was rejected. If it was a mistake (wrong receipt number), ask the organizer to release it so you can submit again."
               : "Complete payment and submit receipt with /submit " + orderRef + " RECEIPT_NO"
       ].join("\n")
     );
   });
 
   userBot.command("claim", async (ctx) => {
+    if (!ctx.from || !(await privacyAcceptedForUserBot(String(ctx.from.id)))) {
+      await replyUserBotPrivacyGate(ctx);
+      return;
+    }
     const args = getArgs(getText(ctx));
     const orderRef = args[0];
     if (!orderRef) {
@@ -1804,13 +2587,23 @@ if (config.telegramUserBotToken) {
         telegramUsername: ctx.from?.username
       });
       const q = issued.tickets.length;
-      await replyWithIssuedTickets(ctx, orderRef, issued.newlyIssued, q);
+      if (issued.newlyIssued.length > 0) {
+        await replyWithIssuedTickets(ctx, orderRef, issued.newlyIssued, q, "newOnly");
+      } else if (issued.tickets.length > 0) {
+        await replyWithIssuedTickets(ctx, orderRef, issued.tickets, q, "allExisting");
+      } else {
+        await ctx.reply("No tickets for this order yet. If payment was approved, try again later or contact support.");
+      }
     } catch (error) {
       await ctx.reply(error instanceof Error ? error.message : "Unable to claim ticket.");
     }
   });
 
   userBot.command("myticket", async (ctx) => {
+    if (!ctx.from || !(await privacyAcceptedForUserBot(String(ctx.from.id)))) {
+      await replyUserBotPrivacyGate(ctx);
+      return;
+    }
     const list = await db.query.tickets.findMany({
       where: eq(tickets.telegramUserId, String(ctx.from.id)),
       orderBy: [desc(tickets.createdAt)],

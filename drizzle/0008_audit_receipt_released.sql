@@ -1,0 +1,1 @@
+ALTER TYPE "public"."audit_action" ADD VALUE 'receipt_released' BEFORE 'ticket_claimed';

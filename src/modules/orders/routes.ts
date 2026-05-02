@@ -2,10 +2,12 @@ import express from "express";
 import multer from "multer";
 import fs from "node:fs";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull, lt, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "../../db/client";
-import { events, eventTiers, orders, receiptSubmissions, tickets } from "../../db/schema";
+import { events, eventTiers, orders, promoCodes, receiptSubmissions, tickets } from "../../db/schema";
+import { effectiveUnitPriceEtb } from "../pricing/effectiveUnitPrice";
+import { assertPromoUsable, computePromoDiscountEtb, PromoApplyError } from "../promo/discount";
 import { config } from "../../config";
 import { buildOrderRef, buildReceiptUrl, buildTelegramUserBotOrderDeepLink, sha256 } from "../../utils";
 import { approveReceiptSubmission } from "../receipts/approveSubmission";
@@ -29,11 +31,12 @@ const createOrderSchema = z.object({
   tierId: z.string().uuid(),
   quantity: z.coerce.number().int().min(1).max(MAX_TICKETS_PER_ORDER).optional().default(1),
   payerPhone: z.string().optional(),
-  telegramUserId: z.string().min(1).optional()
+  telegramUserId: z.string().min(1).optional(),
+  promoCode: z.string().min(2).max(40).optional()
 });
 
 const receiptBodySchema = z.object({
-  receiptNo: z.string().min(6),
+  receiptNo: z.preprocess((v) => (typeof v === "string" ? v.trim() : v), z.string().min(6)),
   verifierMode: z.enum(["manual", "parser"]).optional(),
   /** Telegram numeric user id — link buyer so a ticket row is created and /myticket works */
   telegramUserId: z.string().min(1).optional(),
@@ -41,6 +44,10 @@ const receiptBodySchema = z.object({
 });
 
 export const ordersRouter = express.Router();
+
+function roundEtb(n: number): number {
+  return Math.round(n * 100) / 100;
+}
 
 ordersRouter.post("/orders", async (req, res) => {
   const payload = createOrderSchema.parse(req.body);
@@ -69,48 +76,118 @@ ordersRouter.post("/orders", async (req, res) => {
   }
 
   const qty = payload.quantity;
-  const unitPrice = Number(tier.price);
-  const totalAmount = (unitPrice * qty).toFixed(2);
+  const promoNormalized = payload.promoCode?.trim().toLowerCase();
 
-  const inserted = await db
-    .insert(orders)
-    .values({
-      eventId: payload.eventId,
-      tierId: payload.tierId,
-      orderRef: buildOrderRef(),
-      expectedAmount: totalAmount,
-      quantity: qty,
-      payerPhone: payload.payerPhone,
-      telegramUserId: payload.telegramUserId?.trim() || undefined
-    })
-    .returning();
+  try {
+    const checkout = await db.transaction(async (tx) => {
+      let promoRow: (typeof promoCodes.$inferSelect) | null = null;
+      if (promoNormalized) {
+        const locked = await tx
+          .select()
+          .from(promoCodes)
+          .where(eq(promoCodes.code, promoNormalized))
+          .for("update")
+          .limit(1);
+        promoRow = locked[0] ?? null;
+        if (!promoRow) {
+          throw new PromoApplyError("Invalid promo code.");
+        }
+        assertPromoUsable(promoRow, payload.eventId);
+      }
 
-  const telegramOpenBotUrl = buildTelegramUserBotOrderDeepLink(inserted[0].orderRef);
+      const unitPriceNum = effectiveUnitPriceEtb(tier);
+      const subtotal = roundEtb(unitPriceNum * qty);
+      const discountNum = promoRow ? computePromoDiscountEtb(subtotal, promoRow) : 0;
+      const finalTotal = roundEtb(subtotal - discountNum);
 
-  res.status(201).json({
-    order: inserted[0],
-    paymentInstruction: {
-      receiverNumber: config.telebirrReceiver,
-      receiverName: config.telebirrReceiverName,
-      /** Full order total; Telebirr verification expects one payment/receipt matching this amount */
-      exactAmount: totalAmount,
-      unitPrice: tier.price,
-      quantity: qty,
-      /** Increasing quantity only raises this total — buyer still pays once, submits one receipt */
-      onePaymentForOrderTotal: true,
-      note:
-        qty > 1
-          ? `Pay once: send exactly ${totalAmount} ETB in a single transfer (${qty} tickets × ${tier.price} ETB). Order reference: ${inserted[0].orderRef}. Submit one receipt showing this full amount — it covers all tickets.`
-          : `Pay once: send exactly ${totalAmount} ETB. Order reference: ${inserted[0].orderRef}.`
-    },
-    telegramOpenBotUrl,
-    telegramNextStepHint:
-      telegramOpenBotUrl != null
-        ? qty > 1
-          ? "After one payment for the full total and submitting that receipt on the web, open this link and tap Start in Telegram — you receive one QR per ticket."
-          : "After paying and submitting your receipt on the web, open this link and tap Start in Telegram to receive your ticket QR codes."
-        : null
-  });
+      if (promoRow) {
+        const [bumped] = await tx
+          .update(promoCodes)
+          .set({
+            usesCount: sql`${promoCodes.usesCount} + 1`,
+            updatedAt: new Date()
+          })
+          .where(
+            and(
+              eq(promoCodes.id, promoRow.id),
+              eq(promoCodes.active, true),
+              or(isNull(promoCodes.maxUses), lt(promoCodes.usesCount, promoCodes.maxUses))
+            )
+          )
+          .returning({ id: promoCodes.id });
+        if (!bumped) {
+          throw new PromoApplyError("Promo code is no longer available.", 409);
+        }
+      }
+
+      const orderRef = buildOrderRef();
+      const [orderRow] = await tx
+        .insert(orders)
+        .values({
+          eventId: payload.eventId,
+          tierId: payload.tierId,
+          orderRef,
+          unitPriceEtb: unitPriceNum.toFixed(2),
+          expectedAmount: finalTotal.toFixed(2),
+          promoCodeId: promoRow?.id,
+          promoDiscountEtb: discountNum.toFixed(2),
+          quantity: qty,
+          payerPhone: payload.payerPhone,
+          telegramUserId: payload.telegramUserId?.trim() || undefined
+        })
+        .returning();
+
+      return {
+        order: orderRow!,
+        unitPriceNum,
+        subtotal,
+        discountNum,
+        finalTotal,
+        promoRow
+      };
+    });
+
+    const { order: inserted, unitPriceNum, subtotal, discountNum, finalTotal } = checkout;
+    const totalAmount = finalTotal.toFixed(2);
+    const unitStr = unitPriceNum.toFixed(2);
+    const telegramOpenBotUrl = buildTelegramUserBotOrderDeepLink(inserted.orderRef);
+
+    const baseNote =
+      discountNum > 0
+        ? `Subtotal ${subtotal.toFixed(2)} ETB (${qty} × ${unitStr} ETB)${checkout.promoRow ? `, promo −${discountNum.toFixed(2)} ETB` : ""}. Pay exactly ${totalAmount} ETB total.`
+        : null;
+
+    res.status(201).json({
+      order: inserted,
+      paymentInstruction: {
+        receiverNumber: config.telebirrReceiver,
+        receiverName: config.telebirrReceiverName,
+        exactAmount: totalAmount,
+        unitPrice: unitStr,
+        quantity: qty,
+        subtotalEtb: subtotal.toFixed(2),
+        ...(discountNum > 0 ? { promoDiscountEtb: discountNum.toFixed(2) } : {}),
+        onePaymentForOrderTotal: true,
+        note:
+          qty > 1
+            ? `Pay once: send exactly ${totalAmount} ETB in a single transfer (${qty} tickets × ${unitStr} ETB list price each${discountNum > 0 ? ", after promo" : ""}). Order reference: ${inserted.orderRef}. Submit one receipt showing this full amount — it covers all tickets.${baseNote ? ` ${baseNote}` : ""}`
+            : `Pay once: send exactly ${totalAmount} ETB. Order reference: ${inserted.orderRef}.${baseNote ? ` ${baseNote}` : ""}`
+      },
+      telegramOpenBotUrl,
+      telegramNextStepHint:
+        telegramOpenBotUrl != null
+          ? qty > 1
+            ? "After one payment for the full total and submitting that receipt on the web, open this link and tap Start in Telegram — you receive one QR per ticket."
+            : "After paying and submitting your receipt on the web, open this link and tap Start in Telegram to receive your ticket QR codes."
+          : null
+    });
+  } catch (e) {
+    if (e instanceof PromoApplyError) {
+      res.status(e.statusCode).json({ error: e.message });
+      return;
+    }
+    throw e;
+  }
 });
 
 ordersRouter.post("/orders/:orderId/receipt", rateLimit(8, 10 * 60 * 1000), upload.single("screenshot"), async (req, res) => {
@@ -122,6 +199,17 @@ ordersRouter.post("/orders/:orderId/receipt", rateLimit(8, 10 * 60 * 1000), uplo
 
   if (!order) {
     res.status(404).json({ error: "Order not found." });
+    return;
+  }
+
+  const receiptTaken = await db.query.receiptSubmissions.findFirst({
+    where: eq(receiptSubmissions.receiptNo, body.receiptNo)
+  });
+  if (receiptTaken) {
+    res.status(409).json({
+      error:
+        "This Telebirr receipt was already used. Each receipt can only be submitted once — it cannot be reused for another order after a ticket was issued (or while another submission exists)."
+    });
     return;
   }
 
@@ -257,6 +345,11 @@ ordersRouter.post("/orders/:orderId/receipt", rateLimit(8, 10 * 60 * 1000), uplo
 
   const telegramOpenBotUrl = buildTelegramUserBotOrderDeepLink(orderRow.orderRef);
 
+  const needTicketRecovery =
+    ticketDelivery === "failed" ||
+    ticketDelivery === "no_telegram" ||
+    ticketDelivery === "skipped_existing";
+
   res.status(201).json({
     receiptSubmission: receiptRow,
     order: orderRow,
@@ -267,6 +360,20 @@ ordersRouter.post("/orders/:orderId/receipt", rateLimit(8, 10 * 60 * 1000), uplo
         ? "Open Telegram with this link and tap Start — your order ref is sent with /start so the bot can link your chat and issue your ticket QR codes."
         : null,
     ...(ticketDelivery !== "none" ? { ticketDelivery } : {}),
+    ...(needTicketRecovery
+      ? {
+          ticketRecovery: {
+            claimInUserBot: `/claim ${orderRow.orderRef}`,
+            organizerAdminCommand: `/resendtickets ${orderRow.orderRef}`,
+            summary:
+              ticketDelivery === "skipped_existing"
+                ? "Tickets are already created. In the Telegram user bot, run /claim with your order ref to receive the QR images (safe to repeat)."
+                : ticketDelivery === "no_telegram"
+                  ? "Link your Telegram account first (open the bot via the deep link if available), then run /claim with your order ref."
+                  : "QR images could not be sent to Telegram automatically. In the user bot, run /claim with your order ref; if photos still do not arrive, ask an organizer to resend from the admin bot."
+          }
+        }
+      : {}),
     ...(issuedTickets?.length
       ? {
           tickets: issuedTickets,

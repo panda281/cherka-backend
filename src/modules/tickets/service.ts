@@ -4,7 +4,7 @@ import QRCode from "qrcode";
 import { randomUUID } from "node:crypto";
 import { db } from "../../db/client";
 import { config } from "../../config";
-import { auditLogs, orders, tickets } from "../../db/schema";
+import { auditLogs, eventTiers, events, orders, ticketSaleLedger, tickets } from "../../db/schema";
 
 const MAX_TICKETS_PER_ORDER = 50;
 
@@ -41,6 +41,14 @@ export async function issueTicketsForApprovedOrder(
     if (order.status !== "approved" && order.status !== "ticket_issued") {
       throw new Error("Order is not approved yet.");
     }
+
+    const tierRow = await tx.query.eventTiers.findFirst({
+      where: eq(eventTiers.id, order.tierId)
+    });
+
+    const eventRow = await tx.query.events.findFirst({
+      where: eq(events.id, order.eventId)
+    });
 
     const qty = normalizedQuantity(order.quantity);
 
@@ -88,6 +96,27 @@ export async function issueTicketsForApprovedOrder(
 
       newlyIssued.push(created);
 
+      const lineAllocated = (Number(order.expectedAmount) / qty).toFixed(2);
+      await tx.insert(ticketSaleLedger).values({
+        recordedAt: created.createdAt,
+        ticketId: created.id,
+        eventId: order.eventId,
+        eventNameSnapshot: eventRow?.name ?? "unknown",
+        tierId: order.tierId,
+        tierCodeSnapshot: tierRow?.tierCode ?? "",
+        tierNameSnapshot: tierRow?.tierName ?? "",
+        listUnitPriceEtb: order.unitPriceEtb ?? tierRow?.price ?? "0",
+        orderId: order.id,
+        orderRef: order.orderRef,
+        orderQuantity: qty,
+        orderTotalEtb: order.expectedAmount,
+        lineAllocatedEtb: lineAllocated,
+        currency: "ETB",
+        buyerTelegramUserId: telegramUserId,
+        buyerTelegramUsername: username,
+        source: "issue"
+      });
+
       await tx.insert(auditLogs).values({
         action: "ticket_claimed",
         actor: telegramUserId,
@@ -97,7 +126,11 @@ export async function issueTicketsForApprovedOrder(
           orderRef,
           ticketId: created.id,
           ticketIndex: i + 1,
-          quantity: qty
+          quantity: qty,
+          eventId: order.eventId,
+          tierId: order.tierId,
+          tierCode: tierRow?.tierCode ?? null,
+          tierName: tierRow?.tierName ?? null
         })
       });
     }

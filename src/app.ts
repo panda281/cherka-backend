@@ -9,6 +9,7 @@ import { adminReceiptsRouter } from "./modules/receipts/adminRoutes";
 import { telegramRouter } from "./modules/telegram/routes";
 import { checkinRouter } from "./modules/checkin/routes";
 import { scannerAuthRouter } from "./modules/scanner/authRoutes";
+import { promoAdminRouter } from "./modules/promo/adminRoutes";
 
 export const app = express();
 
@@ -24,6 +25,7 @@ app.get("/health", (_req, res) => {
 
 app.use(eventsRouter);
 app.use(ordersRouter);
+app.use(promoAdminRouter);
 app.use(adminReceiptsRouter);
 app.use(telegramRouter);
 app.use(scannerAuthRouter);

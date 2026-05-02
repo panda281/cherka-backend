@@ -4,8 +4,10 @@ import { z } from "zod";
 import { db } from "../../db/client";
 import { auditLogs, checkins, orders, receiptSubmissions, tickets } from "../../db/schema";
 import { config } from "../../config";
+import { requireScanAuth, requireStaffRole } from "../scanner/scanAuth";
 import { approveReceiptSubmission } from "./approveSubmission";
 import { reverifyReceiptWithTelebirrApi } from "./reverifySubmission";
+import { releaseReceiptSubmissionForResubmit } from "./releaseSubmission";
 
 const approveSchema = z.object({
   verifiedBy: z.string().min(2),
@@ -17,6 +19,11 @@ const approveSchema = z.object({
 
 const reverifySchema = z.object({
   verifiedBy: z.string().min(2)
+});
+
+const releaseSubmissionSchema = z.object({
+  releasedBy: z.string().min(2),
+  notes: z.string().optional()
 });
 
 const rejectSchema = z.object({
@@ -31,6 +38,8 @@ const rejectSchema = z.object({
 });
 
 export const adminReceiptsRouter = express.Router();
+
+adminReceiptsRouter.use(requireScanAuth, requireStaffRole("organizer_admin"));
 
 adminReceiptsRouter.get("/admin/receipt-submissions", async (req, res) => {
   const status = String(req.query.status ?? "verifying");
@@ -154,6 +163,30 @@ adminReceiptsRouter.post("/admin/receipt-submissions/:receiptId/reject", async (
   });
 
   res.json({ receipt: rejectedReceipt, order: updatedOrder });
+});
+
+/**
+ * Remove a rejected or verifying submission so the same Telebirr receipt_no can be used again;
+ * resets the order to pending_receipt. Blocked if the order is approved/ticket_issued or has ticket rows.
+ */
+adminReceiptsRouter.post("/admin/receipt-submissions/:receiptId/release", async (req, res) => {
+  const body = releaseSubmissionSchema.parse(req.body);
+  const result = await releaseReceiptSubmissionForResubmit({
+    receiptId: req.params.receiptId,
+    actor: body.releasedBy,
+    notes: body.notes
+  });
+  if (!result.ok) {
+    res.status(result.statusCode).json({ error: result.error });
+    return;
+  }
+  const order = await db.query.orders.findFirst({ where: eq(orders.id, result.orderId) });
+  res.json({
+    ok: true,
+    freedReceiptNo: result.freedReceiptNo,
+    orderId: result.orderId,
+    order: order ?? null
+  });
 });
 
 adminReceiptsRouter.get("/admin/metrics", async (_req, res) => {

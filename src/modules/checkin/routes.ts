@@ -76,6 +76,7 @@ checkinRouter.post("/checkin/scan", requireScanAuth, async (req, res) => {
     decoded = jwt.verify(body.qrToken, config.jwtSecret) as { jti: string };
   } catch {
     await db.insert(checkins).values({
+      scannerUserId: req.scanAuth?.kind === "scanner_user" ? req.scanAuth.userId : undefined,
       scannerDeviceId: scanActor,
       result: "invalid",
       details: "Invalid ticket signature."
@@ -112,6 +113,7 @@ checkinRouter.post("/checkin/scan", requireScanAuth, async (req, res) => {
     if (ticket.status !== "unused") {
       await tx.insert(checkins).values({
         ticketId: ticket.id,
+        scannerUserId: req.scanAuth?.kind === "scanner_user" ? req.scanAuth.userId : undefined,
         scannerDeviceId: scanActor,
         result: "already_used",
         details: `Ticket first used at ${ticket.used_at?.toISOString() ?? "unknown"} by ${ticket.used_by_gate ?? "unknown"}.`
@@ -130,6 +132,7 @@ checkinRouter.post("/checkin/scan", requireScanAuth, async (req, res) => {
 
     await tx.insert(checkins).values({
       ticketId: ticket.id,
+      scannerUserId: req.scanAuth?.kind === "scanner_user" ? req.scanAuth.userId : undefined,
       scannerDeviceId: scanActor,
       result: "valid",
       details: "First successful scan."
