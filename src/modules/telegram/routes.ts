@@ -68,6 +68,12 @@ function escapeMarkdownV2InlineCode(text: string): string {
   return text.replace(/\\/g, "\\\\").replace(/`/g, "\\`");
 }
 
+/** Telegram text messages cannot use real colors; emoji hints unused / used / void. */
+function formatTicketStatusMarkdownV2(status: string): string {
+  const emoji = status === "unused" ? "🟢" : status === "used" ? "🔵" : "🔴";
+  return `${emoji} *"${escapeMarkdownV2(status)}"*`;
+}
+
 const RECEIPT_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -1441,7 +1447,6 @@ if (config.telegramUserBotToken) {
       .select({
         eventName: events.name,
         startsAt: events.startsAt,
-        endsAt: events.endsAt,
         location: events.location,
         tierCode: eventTiers.tierCode,
         tierName: eventTiers.tierName,
@@ -1456,30 +1461,30 @@ if (config.telegramUserBotToken) {
       .where(eq(tickets.telegramUserId, tgId))
       .orderBy(desc(tickets.createdAt))
       .limit(15);
-    const replyOpts = { parse_mode: "MarkdownV2" as const, ...userMenu };
+    const replyOpts = { parse_mode: "MarkdownV2" as const };
     if (!rows.length) {
       await ctx.reply(`_${escapeMarkdownV2("No tickets found.")}_`, replyOpts);
       return;
     }
-    const header =
-      `*${escapeMarkdownV2(`Your tickets (${rows.length})`)}*\n` +
-      `_${escapeMarkdownV2("Event · when · tier · order · status")}_\n`;
+    const header = `*${escapeMarkdownV2(`Your tickets (${rows.length})`)}*\n\n\n`;
     const lines = rows.map((r) => {
-      const start = r.startsAt.toISOString().replace("T", " ").slice(0, 16);
-      const end = r.endsAt.toISOString().replace("T", " ").slice(0, 16);
-      const rangeCode = `\`${escapeMarkdownV2InlineCode(`${start}–${end}`)}\``;
-      const loc = r.location ? ` · _${escapeMarkdownV2(r.location)}_` : "";
+      const eventDate = r.startsAt.toISOString().replace("T", " ").slice(0, 16);
+      const eventDateCode = `\`${escapeMarkdownV2InlineCode(eventDate)}\``;
+      const locationLine = escapeMarkdownV2(r.location?.trim() ? r.location : "-");
       let extra = "";
       if (r.ticketStatus === "used" && r.usedAt) {
         const usedStr = r.usedAt.toISOString().replace("T", " ").slice(0, 16);
-        extra = `\n_${escapeMarkdownV2("Checked in:")}_ ${`\`${escapeMarkdownV2InlineCode(usedStr)}\``}`;
+        extra = `\n${escapeMarkdownV2("Checked in:")} ${`\`${escapeMarkdownV2InlineCode(usedStr)}\``}`;
       }
-      const tierCode = `\`${escapeMarkdownV2InlineCode(r.tierCode)}\``;
+      const tierCodePart = `\`${escapeMarkdownV2InlineCode(r.tierCode)}\``;
       const orderRef = `\`${escapeMarkdownV2InlineCode(r.orderRef)}\``;
+      const ticketLine = `${escapeMarkdownV2(r.tierName)} \\(${tierCodePart}\\) · ${orderRef}`;
       return (
-        `*${escapeMarkdownV2(r.eventName)}*${loc}\n` +
-        `${rangeCode}\n` +
-        `${escapeMarkdownV2(r.tierName)} \\(${tierCode}\\) · ${orderRef} · *${escapeMarkdownV2(r.ticketStatus)}*${extra}`
+        `${escapeMarkdownV2("Event name:")} ${escapeMarkdownV2(r.eventName)}\n` +
+        `${escapeMarkdownV2("Event Location:")} ${locationLine}\n` +
+        `${escapeMarkdownV2("Event Date:")} ${eventDateCode}\n` +
+        `${escapeMarkdownV2("Ticket :")} ${ticketLine}\n` +
+        `${escapeMarkdownV2("Ticket Status:")} ${formatTicketStatusMarkdownV2(r.ticketStatus)}${extra}`
       );
     });
     await ctx.reply(header + lines.join("\n\n"), replyOpts);
