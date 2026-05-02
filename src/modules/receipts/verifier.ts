@@ -20,23 +20,12 @@ export interface ReceiptVerifier {
   verify(input: ReceiptVerificationInput): Promise<ReceiptVerificationResult>;
 }
 
-function normalizeEthioPhone(raw: string | null | undefined): string {
-  if (!raw) return "";
-  const digits = raw.replace(/\D/g, "");
-  if (digits.startsWith("251") && digits.length >= 12) {
-    return `0${digits.slice(3)}`;
-  }
-  return digits;
-}
-
-/** Compare Telebirr-style accounts (+251… vs 09…). */
-function ethioReceiverMatches(apiValue: string, configuredReceiver: string): boolean {
-  const a = normalizeEthioPhone(apiValue).replace(/\D/g, "");
-  const b = normalizeEthioPhone(configuredReceiver).replace(/\D/g, "");
-  if (!a || !b) return false;
-  if (a === b) return true;
-  const tail = (s: string) => (s.length >= 9 ? s.slice(-9) : s);
-  return tail(a) === tail(b);
+/** Match Telebirr `credited_party_name` to `TELEBIRR_RECEIVER_NAME` (ignore case, trim, collapse spaces). */
+function normalizeCreditedPartyName(s: string): string {
+  return s
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
 }
 
 /** Telebirr API: compare order total to `data.amount` only (not `total_paid`). */
@@ -165,28 +154,46 @@ export class ParserReceiptVerifier implements ReceiptVerifier {
         };
       }
 
-      const creditedRaw = data.credited_party_account_no;
-      const hasCredited =
-        typeof creditedRaw === "string" || typeof creditedRaw === "number"
-          ? String(creditedRaw).trim().length > 0
-          : false;
+      const nameRaw = data.credited_party_name;
+      const creditedName =
+        typeof nameRaw === "string"
+          ? nameRaw.trim()
+          : typeof nameRaw === "number"
+            ? String(nameRaw).trim()
+            : "";
 
-      if (
-        !config.receiptVerifySkipReceiverCheck &&
-        hasCredited &&
-        !ethioReceiverMatches(String(creditedRaw), input.receiverNumber)
-      ) {
-        logReceiptVerify("telebirr_api_receiver_mismatch", {
-          receiptNo: input.receiptNo,
-          creditedParty: String(creditedRaw),
-          expectedReceiver: input.receiverNumber
-        });
-        return {
-          ok: false,
-          mode: "parser",
-          notes: `Receiver mismatch: receipt credits ${String(creditedRaw)}, expected ${input.receiverNumber}. Set RECEIPT_VERIFY_SKIP_RECEIVER_CHECK=true only for demos.`,
-          receiptUrl
-        };
+      if (!config.receiptVerifySkipReceiverCheck) {
+        if (!creditedName) {
+          return {
+            ok: false,
+            mode: "parser",
+            notes:
+              "Verify API: missing `data.credited_party_name` on receipt (receiver is matched by credited name, not phone).",
+            receiptUrl
+          };
+        }
+        const expectedName = input.receiverName.trim();
+        if (!expectedName) {
+          return {
+            ok: false,
+            mode: "parser",
+            notes: "Server misconfiguration: TELEBIRR_RECEIVER_NAME is empty (needed to match credited_party_name).",
+            receiptUrl
+          };
+        }
+        if (normalizeCreditedPartyName(creditedName) !== normalizeCreditedPartyName(expectedName)) {
+          logReceiptVerify("telebirr_api_receiver_name_mismatch", {
+            receiptNo: input.receiptNo,
+            creditedPartyName: creditedName,
+            expectedReceiverName: expectedName
+          });
+          return {
+            ok: false,
+            mode: "parser",
+            notes: `Credited party name mismatch: receipt has "${creditedName}", expected "${expectedName}" (case-insensitive). Set TELEBIRR_RECEIVER_NAME to match the Telebirr receiver display name, or RECEIPT_VERIFY_SKIP_RECEIVER_CHECK=true only for demos.`,
+            receiptUrl
+          };
+        }
       }
 
       const payer =

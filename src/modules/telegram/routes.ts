@@ -1449,7 +1449,7 @@ if (config.telegramUserBotToken) {
         "1) Check progress: /status " + orderRef,
         "2) After approval: /claim " + orderRef + " or just send /start (your account is linked).",
         "",
-        "If auto-verify is configured but failed, check VERIFY logs — amount and receiver must match TELEBIRR_RECEIVER."
+        "If auto-verify is configured but failed, check VERIFY logs — amount must match and Telebirr `credited_party_name` must match TELEBIRR_RECEIVER_NAME (case-insensitive)."
       ].join("\n"),
       userMenu
     );

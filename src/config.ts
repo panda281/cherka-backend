@@ -30,6 +30,6 @@ export const config = {
     .trim()
     .replace(/\s+/g, ""),
   receiptVerifyTimeoutMs: Number(process.env.RECEIPT_VERIFY_TIMEOUT_MS ?? 15000),
-  /** If true, auto-approve only checks amount (not credited party). Less safe — demo only. */
+  /** If true, auto-approve only checks amount (not `credited_party_name`). Less safe — demo only. */
   receiptVerifySkipReceiverCheck: process.env.RECEIPT_VERIFY_SKIP_RECEIVER_CHECK === "true"
 };
