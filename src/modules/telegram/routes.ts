@@ -381,7 +381,7 @@ if (config.telegramAdminBotToken) {
       .where(eq(orders.eventId, eventId));
     const issuedCount = issuedRow?.n ?? 0;
 
-    const detailBody = `Event: ${eventItem.name}\nCategory: ${eventItem.category}\nFeatured: ${eventItem.featured ? "yes (shown first on lists)" : "no"}\nStatus: ${eventItem.status}\nStart: ${eventItem.startsAt.toISOString()}\nEnd: ${eventItem.endsAt.toISOString()}\nLocation: ${eventItem.location ?? "-"}\nEvent image: ${eventItem.eventImageUrl ?? "-"}\nTicket template image: ${eventItem.ticketTemplateImageUrl ?? "-"}\n\nTiers:\n${tiersText}\n\nIssued tickets: ${issuedCount} — use the “Ticket holders” button below for the full list.`;
+    const detailBody = `Event: ${eventItem.name}\nCategory: ${eventItem.category}\nFeatured: ${eventItem.featured ? "yes (shown first on lists)" : "no"}\nStatus: ${eventItem.status} — published = on sale (web + Telegram browse); closed/draft = disabled (no new orders, check-in still works)\nStart: ${eventItem.startsAt.toISOString()}\nEnd: ${eventItem.endsAt.toISOString()}\nLocation: ${eventItem.location ?? "-"}\nEvent image: ${eventItem.eventImageUrl ?? "-"}\nTicket template image: ${eventItem.ticketTemplateImageUrl ?? "-"}\n\nTiers:\n${tiersText}\n\nIssued tickets: ${issuedCount} — use the “Ticket holders” button below for the full list.`;
 
     const tierButtons = tiers.flatMap((tier) => [
       [
@@ -397,6 +397,11 @@ if (config.telegramAdminBotToken) {
       chatId,
       detailBody,
       Markup.inlineKeyboard([
+        [
+          Markup.button.callback("Publish (on sale)", telegramCallbackData(`e_st:${eventId}:pub`)),
+          Markup.button.callback("Close sales", telegramCallbackData(`e_st:${eventId}:clo`))
+        ],
+        [Markup.button.callback("Draft (hidden)", telegramCallbackData(`e_st:${eventId}:dra`))],
         [
           Markup.button.callback("Add Tier", telegramCallbackData(`eat:${eventId}`)),
           Markup.button.callback("Edit Event", telegramCallbackData(`eem:${eventId}`))
@@ -494,7 +499,9 @@ if (config.telegramAdminBotToken) {
     }
     const eventRows = rows.map((eventItem) => {
       const prefix = eventItem.featured ? "[F] " : "";
-      const title = `${prefix}${eventItem.name}`.slice(0, 56);
+      const statusTag =
+        eventItem.status === "published" ? "" : eventItem.status === "closed" ? "[closed] " : "[draft] ";
+      const title = `${statusTag}${prefix}${eventItem.name}`.slice(0, 56);
       return [Markup.button.callback(title, telegramCallbackData(`evd:${eventItem.id}`))];
     });
     await adminBot!.telegram.sendMessage(
@@ -563,6 +570,23 @@ if (config.telegramAdminBotToken) {
     }
     await ctx.answerCbQuery();
     const eventId = ctx.match[1];
+    await sendEventDetail(ctx.chat!.id, eventId);
+  });
+
+  adminBot.action(new RegExp(`^e_st:${CB_UUID}:(pub|clo|dra)$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    const eventId = ctx.match[1];
+    const code = ctx.match[2];
+    const status = code === "pub" ? "published" : code === "clo" ? "closed" : "draft";
+    const [row] = await db.update(events).set({ status, updatedAt: new Date() }).where(eq(events.id, eventId)).returning();
+    if (!row) {
+      await ctx.answerCbQuery("Event not found");
+      return;
+    }
+    await ctx.answerCbQuery(`Set to ${status}`);
     await sendEventDetail(ctx.chat!.id, eventId);
   });
 
@@ -720,7 +744,9 @@ if (config.telegramAdminBotToken) {
     await ctx.reply(
       field === "featured"
         ? "Featured events appear first on public /events and user Browse. Send yes or no."
-        : `Send new value for ${field}. For image fields you can send URL, upload photo, or type skip.`
+        : field === "status"
+          ? "Send status: published (on sale — web + Telegram), closed (disable new orders), or draft (hidden). Or use the buttons on the event screen."
+          : `Send new value for ${field}. For image fields you can send URL, upload photo, or type skip.`
     );
   });
 
@@ -764,7 +790,7 @@ if (config.telegramAdminBotToken) {
     }
     await ctx.answerCbQuery();
     await ctx.reply(
-      "Commands:\n/adminmenu\n/newevent name|…|category(optional)|featured yes/no(optional)\nEvent List: category filter buttons\n/addtier eventId|…\n/verifyqueue\n/approve /reject /reverify …"
+      "Commands:\n/adminmenu\n/newevent name|…|category(optional)|featured yes/no(optional)\nEvent List: category filter buttons — open an event to Publish / Close sales / Draft\n/addtier eventId|…\n/verifyqueue\n/approve /reject /reverify …"
     );
   });
 
@@ -1114,13 +1140,16 @@ if (config.telegramAdminBotToken) {
         await ctx.reply("Invalid date. Send ISO date.");
         return;
       }
-      if (editState.field === "status" && !["draft", "published", "closed"].includes(text)) {
+      const statusNorm = editState.field === "status" ? text.trim().toLowerCase() : text;
+      if (editState.field === "status" && !["draft", "published", "closed"].includes(statusNorm)) {
         await ctx.reply("Status must be draft, published, or closed.");
         return;
       }
       const patch: Record<string, unknown> = { updatedAt: new Date() };
       if (editState.field === "startsAt" || editState.field === "endsAt") {
         patch[editState.field] = new Date(text);
+      } else if (editState.field === "status") {
+        patch.status = statusNorm;
       } else {
         patch[editState.field] = value;
       }

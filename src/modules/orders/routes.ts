@@ -5,7 +5,7 @@ import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "../../db/client";
-import { eventTiers, orders, receiptSubmissions, tickets } from "../../db/schema";
+import { events, eventTiers, orders, receiptSubmissions, tickets } from "../../db/schema";
 import { config } from "../../config";
 import { buildOrderRef, buildReceiptUrl, buildTelegramUserBotOrderDeepLink, sha256 } from "../../utils";
 import { approveReceiptSubmission } from "../receipts/approveSubmission";
@@ -44,6 +44,21 @@ export const ordersRouter = express.Router();
 
 ordersRouter.post("/orders", async (req, res) => {
   const payload = createOrderSchema.parse(req.body);
+  const eventRow = await db.query.events.findFirst({
+    where: eq(events.id, payload.eventId)
+  });
+  if (!eventRow) {
+    res.status(404).json({ error: "Event not found." });
+    return;
+  }
+  if (eventRow.status !== "published") {
+    res.status(403).json({
+      error: "This event is not open for new orders.",
+      eventStatus: eventRow.status
+    });
+    return;
+  }
+
   const tier = await db.query.eventTiers.findFirst({
     where: and(eq(eventTiers.id, payload.tierId), eq(eventTiers.eventId, payload.eventId), eq(eventTiers.active, true))
   });

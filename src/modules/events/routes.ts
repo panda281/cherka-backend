@@ -28,6 +28,10 @@ const createTierSchema = z.object({
   active: z.boolean().optional()
 });
 
+const patchEventSchema = createEventSchema.partial().refine((body) => Object.keys(body).length > 0, {
+  message: "At least one field is required"
+});
+
 eventsRouter.post("/admin/events", async (req, res) => {
   const data = createEventSchema.parse(req.body);
   const inserted = await db
@@ -43,6 +47,29 @@ eventsRouter.post("/admin/events", async (req, res) => {
     .returning();
 
   res.status(201).json(inserted[0]);
+});
+
+eventsRouter.patch("/admin/events/:eventId", async (req, res) => {
+  const data = patchEventSchema.parse(req.body);
+  const eventId = req.params.eventId;
+  const patch: Record<string, unknown> = { updatedAt: new Date() };
+  if (data.name !== undefined) patch.name = data.name;
+  if (data.description !== undefined) patch.description = data.description;
+  if (data.location !== undefined) patch.location = data.location;
+  if (data.category !== undefined) patch.category = data.category;
+  if (data.featured !== undefined) patch.featured = data.featured;
+  if (data.eventImageUrl !== undefined) patch.eventImageUrl = data.eventImageUrl;
+  if (data.ticketTemplateImageUrl !== undefined) patch.ticketTemplateImageUrl = data.ticketTemplateImageUrl;
+  if (data.startsAt !== undefined) patch.startsAt = new Date(data.startsAt);
+  if (data.endsAt !== undefined) patch.endsAt = new Date(data.endsAt);
+  if (data.status !== undefined) patch.status = data.status;
+
+  const updated = await db.update(events).set(patch).where(eq(events.id, eventId)).returning();
+  if (!updated.length) {
+    res.status(404).json({ error: "Event not found" });
+    return;
+  }
+  res.json(updated[0]);
 });
 
 eventsRouter.post("/admin/events/:eventId/tiers", async (req, res) => {
@@ -94,7 +121,11 @@ eventsRouter.get("/events", async (req, res) => {
   const allEvents = await db
     .select()
     .from(events)
-    .where(categoryFilter ? eq(events.category, categoryFilter) : undefined)
+    .where(
+      categoryFilter
+        ? and(eq(events.category, categoryFilter), eq(events.status, "published"))
+        : eq(events.status, "published")
+    )
     .orderBy(desc(events.featured), asc(events.startsAt));
   const tiers = await db.select().from(eventTiers).where(eq(eventTiers.active, true));
 
@@ -107,6 +138,14 @@ eventsRouter.get("/events", async (req, res) => {
 });
 
 eventsRouter.get("/events/:eventId/tiers/:tierCode", async (req, res) => {
+  const eventRow = await db.query.events.findFirst({
+    where: and(eq(events.id, req.params.eventId), eq(events.status, "published"))
+  });
+  if (!eventRow) {
+    res.status(404).json({ error: "Tier not found." });
+    return;
+  }
+
   const tier = await db.query.eventTiers.findFirst({
     where: and(eq(eventTiers.eventId, req.params.eventId), eq(eventTiers.tierCode, req.params.tierCode))
   });
