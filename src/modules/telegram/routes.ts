@@ -39,6 +39,28 @@ function getArgs(text: string): string[] {
 const RECEIPT_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** Telegram limits callback_data to 64 bytes — use compact payloads (tier/event id only + short codes). */
+const CB_UUID = "([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})";
+
+const TIER_FIELD_BY_CODE: Record<string, AdminTierEditState["field"]> = {
+  c: "tierCode",
+  n: "tierName",
+  p: "price",
+  k: "capacity"
+};
+
+const EVENT_FIELD_BY_CODE: Record<string, AdminEditState["field"]> = {
+  n: "name",
+  s: "startsAt",
+  e: "endsAt",
+  l: "location",
+  d: "description",
+  c: "category",
+  t: "status",
+  i: "eventImageUrl",
+  m: "ticketTemplateImageUrl"
+};
+
 /** Accepts raw UUID or copy-paste from verify queue like `receiptId=<uuid>`. */
 function parseReceiptIdArg(raw: string | undefined): string | null {
   if (!raw) return null;
@@ -154,8 +176,8 @@ if (config.telegramAdminBotToken) {
 
     const tierButtons = tiers.flatMap((tier) => [
       [
-        Markup.button.callback(`Edit ${tier.tierCode}`, `admin_tier_edit:${eventId}:${tier.id}`),
-        Markup.button.callback(tier.active ? `Deactivate ${tier.tierCode}` : `Activate ${tier.tierCode}`, `admin_tier_toggle:${eventId}:${tier.id}`)
+        Markup.button.callback(`Edit ${tier.tierCode}`, `t_edit:${tier.id}`),
+        Markup.button.callback(tier.active ? `Deactivate ${tier.tierCode}` : `Activate ${tier.tierCode}`, `t_tgl:${tier.id}`)
       ]
     ]);
 
@@ -244,21 +266,21 @@ if (config.telegramAdminBotToken) {
     await ctx.reply("Add tier to this event.\nStep A: send tier code.");
   });
 
-  adminBot.action(/admin_tier_toggle:(.+):(.+)/, async (ctx) => {
+  adminBot.action(new RegExp(`^t_tgl:${CB_UUID}$`), async (ctx) => {
     if (!isAdminUser(String(ctx.from.id))) {
       await ctx.answerCbQuery("Unauthorized");
       return;
     }
     await ctx.answerCbQuery();
-    const eventId = ctx.match[1];
-    const tierId = ctx.match[2];
+    const tierId = ctx.match[1];
     const tier = await db.query.eventTiers.findFirst({
-      where: and(eq(eventTiers.id, tierId), eq(eventTiers.eventId, eventId))
+      where: eq(eventTiers.id, tierId)
     });
     if (!tier) {
       await ctx.reply("Tier not found.");
       return;
     }
+    const eventId = tier.eventId;
     await db
       .update(eventTiers)
       .set({ active: !tier.active, updatedAt: new Date() })
@@ -267,34 +289,57 @@ if (config.telegramAdminBotToken) {
     await sendEventDetail(ctx.chat!.id, eventId);
   });
 
-  adminBot.action(/admin_tier_edit:(.+):(.+)/, async (ctx) => {
+  adminBot.action(new RegExp(`^t_edit:${CB_UUID}$`), async (ctx) => {
     if (!isAdminUser(String(ctx.from.id))) {
       await ctx.answerCbQuery("Unauthorized");
       return;
     }
     await ctx.answerCbQuery();
-    const eventId = ctx.match[1];
-    const tierId = ctx.match[2];
+    const tierId = ctx.match[1];
+    const tier = await db.query.eventTiers.findFirst({
+      where: eq(eventTiers.id, tierId)
+    });
+    if (!tier) {
+      await ctx.reply("Tier not found.");
+      return;
+    }
+    const eventId = tier.eventId;
     await ctx.reply(
       "Choose tier field to edit:",
       Markup.inlineKeyboard([
-        [Markup.button.callback("Code", `admin_tier_edit_field:${eventId}:${tierId}:tierCode`), Markup.button.callback("Name", `admin_tier_edit_field:${eventId}:${tierId}:tierName`)],
-        [Markup.button.callback("Price", `admin_tier_edit_field:${eventId}:${tierId}:price`), Markup.button.callback("Capacity", `admin_tier_edit_field:${eventId}:${tierId}:capacity`)],
+        [Markup.button.callback("Code", `t_f:${tierId}:c`), Markup.button.callback("Name", `t_f:${tierId}:n`)],
+        [Markup.button.callback("Price", `t_f:${tierId}:p`), Markup.button.callback("Capacity", `t_f:${tierId}:k`)],
         [Markup.button.callback("Back", `admin_event_detail:${eventId}`)]
       ])
     );
   });
 
-  adminBot.action(/admin_tier_edit_field:(.+):(.+):(.+)/, async (ctx) => {
+  adminBot.action(new RegExp(`^t_f:${CB_UUID}:([cnkp])$`), async (ctx) => {
     if (!isAdminUser(String(ctx.from.id))) {
       await ctx.answerCbQuery("Unauthorized");
       return;
     }
     await ctx.answerCbQuery();
-    const eventId = ctx.match[1];
-    const tierId = ctx.match[2];
-    const field = ctx.match[3] as AdminTierEditState["field"];
-    adminTierEditState.set(String(ctx.from.id), { eventId, tierId, field, step: "value" });
+    const tierId = ctx.match[1];
+    const code = ctx.match[2];
+    const field = TIER_FIELD_BY_CODE[code];
+    if (!field) {
+      await ctx.reply("Invalid field.");
+      return;
+    }
+    const tier = await db.query.eventTiers.findFirst({
+      where: eq(eventTiers.id, tierId)
+    });
+    if (!tier) {
+      await ctx.reply("Tier not found.");
+      return;
+    }
+    adminTierEditState.set(String(ctx.from.id), {
+      eventId: tier.eventId,
+      tierId,
+      field,
+      step: "value"
+    });
     await ctx.reply(`Send new value for ${field}. For capacity you can send skip for unlimited.`);
   });
 
@@ -308,24 +353,29 @@ if (config.telegramAdminBotToken) {
     await ctx.reply(
       "Choose field to edit:",
       Markup.inlineKeyboard([
-        [Markup.button.callback("Name", `admin_edit_field:${eventId}:name`), Markup.button.callback("Start Date", `admin_edit_field:${eventId}:startsAt`)],
-        [Markup.button.callback("End Date", `admin_edit_field:${eventId}:endsAt`), Markup.button.callback("Location", `admin_edit_field:${eventId}:location`)],
-        [Markup.button.callback("Description", `admin_edit_field:${eventId}:description`), Markup.button.callback("Category", `admin_edit_field:${eventId}:category`)],
-        [Markup.button.callback("Status", `admin_edit_field:${eventId}:status`), Markup.button.callback("Event Image URL", `admin_edit_field:${eventId}:eventImageUrl`)],
-        [Markup.button.callback("Ticket Template URL", `admin_edit_field:${eventId}:ticketTemplateImageUrl`)],
+        [Markup.button.callback("Name", `e_f:${eventId}:n`), Markup.button.callback("Start Date", `e_f:${eventId}:s`)],
+        [Markup.button.callback("End Date", `e_f:${eventId}:e`), Markup.button.callback("Location", `e_f:${eventId}:l`)],
+        [Markup.button.callback("Description", `e_f:${eventId}:d`), Markup.button.callback("Category", `e_f:${eventId}:c`)],
+        [Markup.button.callback("Status", `e_f:${eventId}:t`), Markup.button.callback("Event Image URL", `e_f:${eventId}:i`)],
+        [Markup.button.callback("Ticket Template URL", `e_f:${eventId}:m`)],
         [Markup.button.callback("Done", `admin_edit_done:${eventId}`)]
       ])
     );
   });
 
-  adminBot.action(/admin_edit_field:(.+):(.+)/, async (ctx) => {
+  adminBot.action(new RegExp(`^e_f:${CB_UUID}:([a-z])$`), async (ctx) => {
     if (!isAdminUser(String(ctx.from.id))) {
       await ctx.answerCbQuery("Unauthorized");
       return;
     }
     await ctx.answerCbQuery();
     const eventId = ctx.match[1];
-    const field = ctx.match[2] as AdminEditState["field"];
+    const code = ctx.match[2];
+    const field = EVENT_FIELD_BY_CODE[code];
+    if (!field) {
+      await ctx.reply("Invalid field.");
+      return;
+    }
     adminEditState.set(String(ctx.from.id), { eventId, step: "value", field });
     await ctx.reply(`Send new value for ${field}. For image fields you can send URL, upload photo, or type skip.`);
   });
