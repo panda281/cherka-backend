@@ -74,6 +74,152 @@ function formatTicketStatusMarkdownV2(status: string): string {
   return `${emoji} *"${escapeMarkdownV2(status)}"*`;
 }
 
+function formatBrowseEventBlock(
+  eventItem: {
+    id: string;
+    name: string;
+    location: string | null;
+    startsAt: Date;
+    endsAt: Date;
+    category: string;
+    featured: boolean;
+  },
+  tiersForEvent: { tierName: string; tierCode: string; price: string }[]
+): string {
+  const title = eventItem.featured
+    ? `✨ *${escapeMarkdownV2(eventItem.name)}*`
+    : `*${escapeMarkdownV2(eventItem.name)}*`;
+  const loc = escapeMarkdownV2(eventItem.location?.trim() ? eventItem.location : "-");
+  const start = eventItem.startsAt.toISOString().replace("T", " ").slice(0, 16);
+  const end = eventItem.endsAt.toISOString().replace("T", " ").slice(0, 16);
+  const rangeCode = `\`${escapeMarkdownV2InlineCode(`${start} – ${end}`)}\``;
+  const cat = escapeMarkdownV2(eventItem.category);
+  const tierLines =
+    tiersForEvent.length === 0
+      ? escapeMarkdownV2("No tiers available.")
+      : tiersForEvent
+          .map((tier) => {
+            const priceStr = escapeMarkdownV2(String(tier.price));
+            const code = `\`${escapeMarkdownV2InlineCode(tier.tierCode)}\``;
+            return `• ${escapeMarkdownV2(tier.tierName)} \\(${code}\\) · ETB ${priceStr}`;
+          })
+          .join("\n");
+  const idCode = `\`${escapeMarkdownV2InlineCode(eventItem.id)}\``;
+  return (
+    `${title}\n` +
+    `${escapeMarkdownV2("Event Location:")} ${loc}\n` +
+    `${escapeMarkdownV2("Event Date:")} ${rangeCode}\n` +
+    `${escapeMarkdownV2("Category:")} ${cat}\n` +
+    `${escapeMarkdownV2("Tiers:")}\n${tierLines}\n` +
+    `${escapeMarkdownV2("Event ID:")} ${idCode}`
+  );
+}
+
+async function replyPublishedEventsBrowse(ctx: Context): Promise<void> {
+  const activeEvents = await db.query.events.findMany({
+    where: inArray(events.status, ["published"]),
+    orderBy: [desc(events.featured), desc(events.startsAt)]
+  });
+  if (!activeEvents.length) {
+    await ctx.reply("No published events found.");
+    return;
+  }
+  const eventIds = activeEvents.map((e) => e.id);
+  const tierRows = await db.query.eventTiers.findMany({
+    where: and(inArray(eventTiers.eventId, eventIds), eq(eventTiers.active, true)),
+    orderBy: [eventTiers.tierName]
+  });
+  const blocks = activeEvents.map((eventItem) => {
+    const tiersForEvent = tierRows.filter((t) => t.eventId === eventItem.id);
+    return formatBrowseEventBlock(eventItem, tiersForEvent);
+  });
+  const replyOpts = { parse_mode: "MarkdownV2" as const };
+  const header =
+    `*${escapeMarkdownV2("Browse events")}*\n` +
+    `_${escapeMarkdownV2(`${activeEvents.length} published · use Event ID on the web or /buy to refresh`)}_\n\n`;
+  const budgetFirst = Math.max(500, 3900 - header.length);
+  const budgetRest = 3900;
+  let remaining = blocks;
+  let first = true;
+  while (remaining.length > 0) {
+    const budget = first ? budgetFirst : budgetRest;
+    const chunk: string[] = [];
+    let len = 0;
+    while (remaining.length > 0) {
+      const next = remaining[0]!;
+      const add = chunk.length > 0 ? 2 + next.length : next.length;
+      if (len + add > budget && chunk.length > 0) {
+        break;
+      }
+      if (len + add > budget && chunk.length === 0) {
+        chunk.push(next);
+        remaining = remaining.slice(1);
+        break;
+      }
+      chunk.push(next);
+      remaining = remaining.slice(1);
+      len += add;
+    }
+    const body = chunk.join("\n\n");
+    await ctx.reply(first ? header + body : body, replyOpts);
+    first = false;
+  }
+}
+
+async function replyMyTicketsPage(ctx: Context): Promise<void> {
+  const from = ctx.from;
+  if (!from) {
+    await ctx.reply("Could not resolve your Telegram account.");
+    return;
+  }
+  const tgId = String(from.id);
+  const rows = await db
+    .select({
+      eventName: events.name,
+      startsAt: events.startsAt,
+      location: events.location,
+      tierCode: eventTiers.tierCode,
+      tierName: eventTiers.tierName,
+      orderRef: orders.orderRef,
+      ticketStatus: tickets.status,
+      usedAt: tickets.usedAt
+    })
+    .from(tickets)
+    .innerJoin(orders, eq(tickets.orderId, orders.id))
+    .innerJoin(events, eq(orders.eventId, events.id))
+    .innerJoin(eventTiers, eq(orders.tierId, eventTiers.id))
+    .where(eq(tickets.telegramUserId, tgId))
+    .orderBy(desc(tickets.createdAt))
+    .limit(15);
+  const replyOpts = { parse_mode: "MarkdownV2" as const };
+  if (!rows.length) {
+    await ctx.reply(`_${escapeMarkdownV2("No tickets found.")}_`, replyOpts);
+    return;
+  }
+  const header = `*${escapeMarkdownV2(`Your tickets (${rows.length})`)}*\n\n\n`;
+  const lines = rows.map((r) => {
+    const eventDate = r.startsAt.toISOString().replace("T", " ").slice(0, 16);
+    const eventDateCode = `\`${escapeMarkdownV2InlineCode(eventDate)}\``;
+    const locationLine = escapeMarkdownV2(r.location?.trim() ? r.location : "-");
+    let extra = "";
+    if (r.ticketStatus === "used" && r.usedAt) {
+      const usedStr = r.usedAt.toISOString().replace("T", " ").slice(0, 16);
+      extra = `\n${escapeMarkdownV2("Checked in:")} ${`\`${escapeMarkdownV2InlineCode(usedStr)}\``}`;
+    }
+    const tierCodePart = `\`${escapeMarkdownV2InlineCode(r.tierCode)}\``;
+    const orderRef = `\`${escapeMarkdownV2InlineCode(r.orderRef)}\``;
+    const ticketLine = `${escapeMarkdownV2(r.tierName)} \\(${tierCodePart}\\) · ${orderRef}`;
+    return (
+      `${escapeMarkdownV2("Event name:")} ${escapeMarkdownV2(r.eventName)}\n` +
+      `${escapeMarkdownV2("Event Location:")} ${locationLine}\n` +
+      `${escapeMarkdownV2("Event Date:")} ${eventDateCode}\n` +
+      `${escapeMarkdownV2("Ticket :")} ${ticketLine}\n` +
+      `${escapeMarkdownV2("Ticket Status:")} ${formatTicketStatusMarkdownV2(r.ticketStatus)}${extra}`
+    );
+  });
+  await ctx.reply(header + lines.join("\n\n"), replyOpts);
+}
+
 const RECEIPT_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -1407,27 +1553,7 @@ if (config.telegramUserBotToken) {
 
   userBot.action("user_buy", async (ctx) => {
     await ctx.answerCbQuery();
-    const activeEvents = await db.query.events.findMany({
-      where: inArray(events.status, ["published"]),
-      orderBy: [desc(events.featured), desc(events.startsAt)]
-    });
-    if (!activeEvents.length) {
-      await ctx.reply("No published events found.");
-      return;
-    }
-    const eventIds = activeEvents.map((eventItem) => eventItem.id);
-    const tierRows = await db.query.eventTiers.findMany({
-      where: and(inArray(eventTiers.eventId, eventIds), eq(eventTiers.active, true))
-    });
-    const lines = activeEvents.map((eventItem) => {
-      const tiersForEvent = tierRows
-        .filter((tier) => tier.eventId === eventItem.id)
-        .map((tier) => `${tier.tierName} (${tier.tierCode}) - ETB ${tier.price}`)
-        .join(", ");
-      const feat = eventItem.featured ? "[Featured] " : "";
-      return `${feat}${eventItem.name}\nEventID: ${eventItem.id}\nTiers: ${tiersForEvent || "none"}`;
-    });
-    await ctx.reply(lines.join("\n\n"));
+    await replyPublishedEventsBrowse(ctx);
   });
 
   userBot.action("user_submit_help", async (ctx) => {
@@ -1442,76 +1568,19 @@ if (config.telegramUserBotToken) {
 
   userBot.action("user_myticket", async (ctx) => {
     await ctx.answerCbQuery();
-    const tgId = String(ctx.from.id);
-    const rows = await db
-      .select({
-        eventName: events.name,
-        startsAt: events.startsAt,
-        location: events.location,
-        tierCode: eventTiers.tierCode,
-        tierName: eventTiers.tierName,
-        orderRef: orders.orderRef,
-        ticketStatus: tickets.status,
-        usedAt: tickets.usedAt
-      })
-      .from(tickets)
-      .innerJoin(orders, eq(tickets.orderId, orders.id))
-      .innerJoin(events, eq(orders.eventId, events.id))
-      .innerJoin(eventTiers, eq(orders.tierId, eventTiers.id))
-      .where(eq(tickets.telegramUserId, tgId))
-      .orderBy(desc(tickets.createdAt))
-      .limit(15);
-    const replyOpts = { parse_mode: "MarkdownV2" as const };
-    if (!rows.length) {
-      await ctx.reply(`_${escapeMarkdownV2("No tickets found.")}_`, replyOpts);
-      return;
-    }
-    const header = `*${escapeMarkdownV2(`Your tickets (${rows.length})`)}*\n\n\n`;
-    const lines = rows.map((r) => {
-      const eventDate = r.startsAt.toISOString().replace("T", " ").slice(0, 16);
-      const eventDateCode = `\`${escapeMarkdownV2InlineCode(eventDate)}\``;
-      const locationLine = escapeMarkdownV2(r.location?.trim() ? r.location : "-");
-      let extra = "";
-      if (r.ticketStatus === "used" && r.usedAt) {
-        const usedStr = r.usedAt.toISOString().replace("T", " ").slice(0, 16);
-        extra = `\n${escapeMarkdownV2("Checked in:")} ${`\`${escapeMarkdownV2InlineCode(usedStr)}\``}`;
-      }
-      const tierCodePart = `\`${escapeMarkdownV2InlineCode(r.tierCode)}\``;
-      const orderRef = `\`${escapeMarkdownV2InlineCode(r.orderRef)}\``;
-      const ticketLine = `${escapeMarkdownV2(r.tierName)} \\(${tierCodePart}\\) · ${orderRef}`;
-      return (
-        `${escapeMarkdownV2("Event name:")} ${escapeMarkdownV2(r.eventName)}\n` +
-        `${escapeMarkdownV2("Event Location:")} ${locationLine}\n` +
-        `${escapeMarkdownV2("Event Date:")} ${eventDateCode}\n` +
-        `${escapeMarkdownV2("Ticket :")} ${ticketLine}\n` +
-        `${escapeMarkdownV2("Ticket Status:")} ${formatTicketStatusMarkdownV2(r.ticketStatus)}${extra}`
-      );
-    });
-    await ctx.reply(header + lines.join("\n\n"), replyOpts);
+    await replyMyTicketsPage(ctx);
+  });
+
+  userBot.command("browse", async (ctx) => {
+    await replyPublishedEventsBrowse(ctx);
+  });
+
+  userBot.command("mytickets", async (ctx) => {
+    await replyMyTicketsPage(ctx);
   });
 
   userBot.command("buy", async (ctx) => {
-    const activeEvents = await db.query.events.findMany({
-      where: inArray(events.status, ["published"]),
-      orderBy: [desc(events.featured), desc(events.startsAt)]
-    });
-    if (!activeEvents.length) {
-      await ctx.reply("No published events found.");
-      return;
-    }
-    const eventIds = activeEvents.map((eventItem) => eventItem.id);
-    const tierRows = await db.query.eventTiers.findMany({
-      where: and(inArray(eventTiers.eventId, eventIds), eq(eventTiers.active, true))
-    });
-    const lines = activeEvents.map((eventItem) => {
-      const tiersForEvent = tierRows
-        .filter((tier) => tier.eventId === eventItem.id)
-        .map((tier) => `${tier.tierName} (${tier.tierCode}) - ETB ${tier.price}`)
-        .join(", ");
-      const feat = eventItem.featured ? "[Featured] " : "";
-      return `${feat}${eventItem.name}\nEventID: ${eventItem.id}\nTiers: ${tiersForEvent || "none"}`;
-    });
-    await ctx.reply(lines.join("\n\n"));
+    await replyPublishedEventsBrowse(ctx);
   });
 
   userBot.command("submit", async (ctx) => {
