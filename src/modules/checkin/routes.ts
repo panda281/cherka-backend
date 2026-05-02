@@ -12,6 +12,39 @@ const scanSchema = z.object({
   scannerDeviceId: z.string().min(2).max(100)
 });
 
+type ScanGuestPayload = {
+  holder: string;
+  ticketType: string;
+  eventName: string;
+};
+
+async function loadGuestPayload(
+  tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+  ticketId: string
+): Promise<ScanGuestPayload | null> {
+  const rows = await tx.execute(sql`
+    SELECT t.telegram_username, et.tier_name, e.name AS event_name
+    FROM tickets t
+    INNER JOIN orders o ON o.id = t.order_id
+    INNER JOIN event_tiers et ON et.id = o.tier_id
+    INNER JOIN events e ON e.id = o.event_id
+    WHERE t.id = ${ticketId}
+  `);
+  const r = rows.rows[0] as
+    | { telegram_username: string | null; tier_name: string; event_name: string }
+    | undefined;
+  if (!r) return null;
+  const holder =
+    r.telegram_username && r.telegram_username.trim().length > 0
+      ? `@${r.telegram_username.trim().replace(/^@/, "")}`
+      : "Guest";
+  return {
+    holder,
+    ticketType: r.tier_name,
+    eventName: r.event_name
+  };
+}
+
 export const checkinRouter = express.Router();
 
 checkinRouter.post("/checkin/scan", requireScanAuth, async (req, res) => {
@@ -27,7 +60,10 @@ checkinRouter.post("/checkin/scan", requireScanAuth, async (req, res) => {
       result: "invalid",
       details: "Invalid ticket signature."
     });
-    res.status(422).json({ result: "invalid", reason: "Invalid or expired ticket." });
+    res.status(422).json({
+      result: "invalid",
+      message: "This QR code is not valid or has expired. Ask the guest to open their ticket again."
+    });
     return;
   }
 
@@ -44,8 +80,13 @@ checkinRouter.post("/checkin/scan", requireScanAuth, async (req, res) => {
       | undefined;
 
     if (!ticket) {
-      return { result: "invalid" as const, reason: "Ticket not found." };
+      return {
+        result: "invalid" as const,
+        message: "We could not find this ticket. It may be for another event."
+      };
     }
+
+    const guest = await loadGuestPayload(tx, ticket.id);
 
     if (ticket.status !== "unused") {
       await tx.insert(checkins).values({
@@ -56,8 +97,8 @@ checkinRouter.post("/checkin/scan", requireScanAuth, async (req, res) => {
       });
       return {
         result: "already_used" as const,
-        usedAt: ticket.used_at,
-        usedByGate: ticket.used_by_gate
+        guest,
+        message: "This ticket was already scanned. Entry is not allowed again."
       };
     }
 
@@ -80,7 +121,11 @@ checkinRouter.post("/checkin/scan", requireScanAuth, async (req, res) => {
       metadata: JSON.stringify({ result: "valid", scannerDeviceId: body.scannerDeviceId })
     });
 
-    return { result: "valid" as const };
+    return {
+      result: "valid" as const,
+      guest,
+      message: "Valid ticket. You may enter."
+    };
   });
 
   res.json(outcome);
