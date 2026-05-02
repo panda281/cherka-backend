@@ -1,5 +1,5 @@
 import express from "express";
-import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { Markup, Telegraf } from "telegraf";
 import type { Context } from "telegraf";
 import { config } from "../../config";
@@ -11,7 +11,7 @@ import { approveReceiptSubmission } from "../receipts/approveSubmission";
 import { reverifyReceiptWithTelebirrApi } from "../receipts/reverifySubmission";
 import { logReceiptVerify } from "../receipts/verifyLogging";
 import { resolveReceiptVerification } from "../receipts/verifier";
-import { issueTicketForApprovedOrder } from "../tickets/service";
+import { issueTicketsForApprovedOrder } from "../tickets/service";
 
 export const telegramRouter = express.Router();
 
@@ -913,23 +913,32 @@ if (config.telegramAdminBotToken) {
       reply += "\n\nTicket could not be created automatically; buyer can try /claim.";
     }
     await ctx.reply(reply);
-    if (result.hasTicket && result.ticket && result.telegramUserId && userBot) {
+    const toPush = result.hasTicket ? result.newlyIssuedTickets : [];
+    if (toPush.length > 0 && result.telegramUserId && userBot) {
       try {
-        await userBot.telegram.sendPhoto(
-          result.telegramUserId,
-          { source: Buffer.from(result.ticket.qrImageDataUrl.split(",")[1], "base64") },
-          {
-            caption: `Ticket for order ${result.orderRef}. Payment verified — this QR can be used once.`
-          }
-        );
-        await ctx.reply("QR sent to the buyer via the user bot.");
+        const total = result.tickets.length;
+        const offset = total - toPush.length;
+        for (let i = 0; i < toPush.length; i++) {
+          const row = toPush[i]!;
+          await userBot.telegram.sendPhoto(
+            result.telegramUserId,
+            { source: Buffer.from(row.qrImageDataUrl.split(",")[1], "base64") },
+            {
+              caption:
+                total > 1
+                  ? `Ticket ${offset + i + 1}/${total} · order ${result.orderRef}. Payment verified — each QR once.`
+                  : `Ticket for order ${result.orderRef}. Payment verified — this QR can be used once.`
+            }
+          );
+        }
+        await ctx.reply("QR code(s) sent to the buyer via the user bot.");
       } catch (err) {
         await ctx.reply(
-          `Order approved and ticket saved, but sending the QR to the user failed: ${err instanceof Error ? err.message : String(err)} (blocked bot / invalid chat).`
+          `Order approved and ticket(s) saved, but sending QR(s) to the user failed: ${err instanceof Error ? err.message : String(err)} (blocked bot / invalid chat).`
         );
       }
-    } else if (result.hasTicket && result.ticket && result.telegramUserId && !userBot) {
-      await ctx.reply("User bot token not configured — could not push QR. Ticket is stored; buyer can use /myticket on the user bot.");
+    } else if (result.hasTicket && toPush.length > 0 && result.telegramUserId && !userBot) {
+      await ctx.reply("User bot token not configured — could not push QR. Tickets are stored; buyer can use /mytickets on the user bot.");
     }
   });
 
@@ -1436,15 +1445,30 @@ if (config.telegramUserBotToken) {
     return m ? m[1].trim() : undefined;
   }
 
-  async function replyWithIssuedTicket(
+  async function replyWithIssuedTickets(
     ctx: Context,
     orderRef: string,
-    ticket: Awaited<ReturnType<typeof issueTicketForApprovedOrder>>
+    ticketRows: Awaited<ReturnType<typeof issueTicketsForApprovedOrder>>["newlyIssued"],
+    totalQty: number
   ) {
-    await ctx.replyWithPhoto({ source: Buffer.from(ticket.qrImageDataUrl.split(",")[1], "base64") }, {
-      caption: `Ticket issued for order ${orderRef}. This QR can be used once.`
-    });
+    if (ticketRows.length === 0) {
+      return;
+    }
+    const baseIndex = totalQty - ticketRows.length;
+    for (let i = 0; i < ticketRows.length; i++) {
+      const ticket = ticketRows[i]!;
+      const caption =
+        totalQty > 1
+          ? `Ticket ${baseIndex + i + 1}/${totalQty} for order ${orderRef}. Each QR can be used once.`
+          : `Ticket issued for order ${orderRef}. This QR can be used once.`;
+      await ctx.replyWithPhoto(
+        { source: Buffer.from(ticket.qrImageDataUrl.split(",")[1], "base64") },
+        { caption }
+      );
+    }
   }
+
+  const fewerTicketsThanOrdered = sql`(SELECT COUNT(*)::int FROM ${tickets} WHERE ${tickets.orderId} = ${orders.id}) < ${orders.quantity}`;
 
   /**
    * Approved + paid (Telebirr) but order still has no Telegram link and no ticket yet — e.g. receipt submitted via web API.
@@ -1477,12 +1501,15 @@ if (config.telegramUserBotToken) {
     const orderRef = unlinked[0]!.orderRef;
     await db.update(orders).set({ telegramUserId: tgId, updatedAt: new Date() }).where(eq(orders.orderRef, orderRef));
     try {
-      const ticket = await issueTicketForApprovedOrder(orderRef, tgId, {
+      const issued = await issueTicketsForApprovedOrder(orderRef, tgId, {
         telegramUsername: ctx.from?.username
       });
-      await replyWithIssuedTicket(ctx, orderRef, ticket);
+      const q = issued.tickets.length;
+      await replyWithIssuedTickets(ctx, orderRef, issued.newlyIssued, q);
       await ctx.reply(
-        "Linked this chat to your order (your Telegram id from /start) and sent your ticket above.",
+        issued.newlyIssued.length > 0
+          ? "Linked this chat to your order (your Telegram id from /start) and sent your ticket QR code(s) above."
+          : "Your ticket QR codes were already issued for this order. Use My Tickets.",
         userMenu
       );
       return true;
@@ -1498,18 +1525,26 @@ if (config.telegramUserBotToken) {
     const row = await db
       .select({ orderRef: orders.orderRef })
       .from(orders)
-      .leftJoin(tickets, eq(tickets.orderId, orders.id))
-      .where(and(eq(orders.telegramUserId, tgId), eq(orders.status, "approved"), isNull(tickets.id)))
+      .where(
+        and(
+          eq(orders.telegramUserId, tgId),
+          or(eq(orders.status, "approved"), eq(orders.status, "ticket_issued")),
+          fewerTicketsThanOrdered
+        )
+      )
       .limit(1);
     const first = row[0];
     if (!first) return false;
     try {
-      const ticket = await issueTicketForApprovedOrder(first.orderRef, tgId, {
+      const issued = await issueTicketsForApprovedOrder(first.orderRef, tgId, {
         telegramUsername: ctx.from?.username
       });
-      await replyWithIssuedTicket(ctx, first.orderRef, ticket);
+      const q = issued.tickets.length;
+      await replyWithIssuedTickets(ctx, first.orderRef, issued.newlyIssued, q);
       await ctx.reply(
-        "/start claimed your ticket automatically — this Telegram account is linked to that order.",
+        issued.newlyIssued.length > 0
+          ? "/start issued your ticket QR code(s) automatically — this Telegram account is linked to that order."
+          : "Tickets for that order were already issued. Use My Tickets.",
         userMenu
       );
       return true;
@@ -1524,11 +1559,15 @@ if (config.telegramUserBotToken) {
     if (deepRef) {
       await db.update(orders).set({ telegramUserId: tgId, updatedAt: new Date() }).where(eq(orders.orderRef, deepRef));
       try {
-        const ticket = await issueTicketForApprovedOrder(deepRef, tgId, {
+        const issued = await issueTicketsForApprovedOrder(deepRef, tgId, {
           telegramUsername: ctx.from?.username
         });
-        await replyWithIssuedTicket(ctx, deepRef, ticket);
-        await ctx.reply("Your ticket QR is above.", userMenu);
+        const q = issued.tickets.length;
+        await replyWithIssuedTickets(ctx, deepRef, issued.newlyIssued, q);
+        await ctx.reply(
+          issued.newlyIssued.length > 0 ? "Your ticket QR code(s) are above." : "Tickets were already issued. Use My Tickets.",
+          userMenu
+        );
         return;
       } catch (e) {
         await ctx.reply(e instanceof Error ? e.message : "Could not issue ticket yet.", userMenu);
@@ -1654,12 +1693,21 @@ if (config.telegramUserBotToken) {
 
     if (autoApproved) {
       try {
-        const ticket = await issueTicketForApprovedOrder(orderRef, String(ctx.from!.id), {
+        const issued = await issueTicketsForApprovedOrder(orderRef, String(ctx.from!.id), {
           telegramUsername: ctx.from?.username
         });
-        logReceiptVerify("telegram_submit_qr_ok", { orderRef, ticketId: ticket.id });
-        await replyWithIssuedTicket(ctx, orderRef, ticket);
-        await ctx.reply("Receipt auto-approved — your QR is above. Use /menu for more.", userMenu);
+        const q = issued.tickets.length;
+        logReceiptVerify("telegram_submit_qr_ok", {
+          orderRef,
+          ticketIds: issued.newlyIssued.map((t) => t.id)
+        });
+        await replyWithIssuedTickets(ctx, orderRef, issued.newlyIssued, q);
+        await ctx.reply(
+          issued.newlyIssued.length > 0
+            ? "Receipt auto-approved — your QR code(s) are above. Use /menu for more."
+            : "Receipt auto-approved — tickets were already issued. Use /mytickets.",
+          userMenu
+        );
         return;
       } catch (err) {
         logReceiptVerify("telegram_submit_qr_fail", {
@@ -1725,7 +1773,7 @@ if (config.telegramUserBotToken) {
         receiptLine,
         "",
         order.status === "approved" || order.status === "ticket_issued"
-          ? "You can claim your ticket: /claim " + orderRef
+          ? "You can claim your ticket QR codes: /claim " + orderRef
           : order.status === "verifying"
             ? "Waiting for admin to verify your receipt. Try again later with /status"
             : order.status === "rejected"
@@ -1747,10 +1795,14 @@ if (config.telegramUserBotToken) {
       .set({ telegramUserId: String(ctx.from!.id), updatedAt: new Date() })
       .where(eq(orders.orderRef, orderRef));
     try {
-      const ticket = await issueTicketForApprovedOrder(orderRef, String(ctx.from.id), {
+      const issued = await issueTicketsForApprovedOrder(orderRef, String(ctx.from.id), {
         telegramUsername: ctx.from?.username
       });
-      await replyWithIssuedTicket(ctx, orderRef, ticket);
+      const q = issued.tickets.length;
+      await replyWithIssuedTickets(ctx, orderRef, issued.newlyIssued, q);
+      if (issued.newlyIssued.length === 0) {
+        await ctx.reply("Tickets were already issued for this order. Use /mytickets.", userMenu);
+      }
     } catch (error) {
       await ctx.reply(error instanceof Error ? error.message : "Unable to claim ticket.");
     }
@@ -1826,8 +1878,8 @@ telegramRouter.post("/telegram/user/claim", async (req, res) => {
   }
 
   try {
-    const ticket = await issueTicketForApprovedOrder(orderRef, telegramUserId, { telegramUsername });
-    res.json({ ticket });
+    const issued = await issueTicketsForApprovedOrder(orderRef, telegramUserId, { telegramUsername });
+    res.json({ tickets: issued.tickets, ticket: issued.tickets[0] ?? null, newlyIssued: issued.newlyIssued });
   } catch (error) {
     res.status(422).json({ error: error instanceof Error ? error.message : "Claim failed." });
   }

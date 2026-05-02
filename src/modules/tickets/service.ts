@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import jwt from "jsonwebtoken";
 import QRCode from "qrcode";
 import { randomUUID } from "node:crypto";
@@ -6,11 +6,20 @@ import { db } from "../../db/client";
 import { config } from "../../config";
 import { auditLogs, orders, tickets } from "../../db/schema";
 
-export async function issueTicketForApprovedOrder(
+export type IssuedTicketsResult = {
+  tickets: (typeof tickets.$inferSelect)[];
+  newlyIssued: (typeof tickets.$inferSelect)[];
+};
+
+/**
+ * Ensures an approved order has exactly `order.quantity` ticket rows (each with its own QR).
+ * Idempotent: repeated calls add only missing tickets and return full list.
+ */
+export async function issueTicketsForApprovedOrder(
   orderRef: string,
   telegramUserId: string,
   opts?: { telegramUsername?: string | null }
-) {
+): Promise<IssuedTicketsResult> {
   return db.transaction(async (tx) => {
     const order = await tx.query.orders.findFirst({
       where: eq(orders.orderRef, orderRef)
@@ -23,57 +32,85 @@ export async function issueTicketForApprovedOrder(
       throw new Error("Order is not approved yet.");
     }
 
-    const existingTicket = await tx.query.tickets.findFirst({
-      where: eq(tickets.orderId, order.id)
+    const qty = Math.max(1, order.quantity);
+
+    const existing = await tx.query.tickets.findMany({
+      where: eq(tickets.orderId, order.id),
+      orderBy: [asc(tickets.createdAt)]
     });
 
-    if (existingTicket) {
-      return existingTicket;
+    if (existing.length >= qty) {
+      return { tickets: existing, newlyIssued: [] };
     }
-
-    const tokenJti = randomUUID();
-    const payload = {
-      ticketId: randomUUID(),
-      eventId: order.eventId,
-      tierId: order.tierId,
-      telegramUserId,
-      jti: tokenJti,
-      orderRef
-    };
-    const qrPayload = jwt.sign(payload, config.jwtSecret, { expiresIn: "14d" });
-    const qrImageDataUrl = await QRCode.toDataURL(qrPayload, { errorCorrectionLevel: "M" });
 
     const username =
       opts?.telegramUsername != null && opts.telegramUsername !== ""
         ? opts.telegramUsername
         : null;
 
-    const [created] = await tx
-      .insert(tickets)
-      .values({
-        orderId: order.id,
+    const newlyIssued: (typeof tickets.$inferSelect)[] = [];
+
+    for (let i = existing.length; i < qty; i++) {
+      const tokenJti = randomUUID();
+      const payload = {
+        ticketId: randomUUID(),
+        eventId: order.eventId,
+        tierId: order.tierId,
         telegramUserId,
-        telegramUsername: username,
-        tokenJti,
-        qrPayload,
-        qrImageDataUrl,
-        status: "unused"
-      })
-      .returning();
+        jti: tokenJti,
+        orderRef
+      };
+      const qrPayload = jwt.sign(payload, config.jwtSecret, { expiresIn: "14d" });
+      const qrImageDataUrl = await QRCode.toDataURL(qrPayload, { errorCorrectionLevel: "M" });
+
+      const [created] = await tx
+        .insert(tickets)
+        .values({
+          orderId: order.id,
+          telegramUserId,
+          telegramUsername: username,
+          tokenJti,
+          qrPayload,
+          qrImageDataUrl,
+          status: "unused"
+        })
+        .returning();
+
+      newlyIssued.push(created);
+
+      await tx.insert(auditLogs).values({
+        action: "ticket_claimed",
+        actor: telegramUserId,
+        entityType: "order",
+        entityId: order.id,
+        metadata: JSON.stringify({
+          orderRef,
+          ticketId: created.id,
+          ticketIndex: i + 1,
+          quantity: qty
+        })
+      });
+    }
 
     await tx
       .update(orders)
       .set({ status: "ticket_issued", updatedAt: new Date() })
       .where(and(eq(orders.id, order.id), eq(orders.status, "approved")));
 
-    await tx.insert(auditLogs).values({
-      action: "ticket_claimed",
-      actor: telegramUserId,
-      entityType: "order",
-      entityId: order.id,
-      metadata: JSON.stringify({ orderRef, ticketId: created.id })
-    });
-
-    return created;
+    return { tickets: [...existing, ...newlyIssued], newlyIssued };
   });
+}
+
+/** Returns the first ticket row after ensuring the full quantity is issued. */
+export async function issueTicketForApprovedOrder(
+  orderRef: string,
+  telegramUserId: string,
+  opts?: { telegramUsername?: string | null }
+) {
+  const { tickets: rows } = await issueTicketsForApprovedOrder(orderRef, telegramUserId, opts);
+  const first = rows[0];
+  if (!first) {
+    throw new Error("No tickets could be issued.");
+  }
+  return first;
 }

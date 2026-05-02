@@ -112,6 +112,8 @@ adminReceiptsRouter.post("/admin/receipt-submissions/:receiptId/reverify", async
     verificationNotes: result.verificationNotes,
     hasTicket: result.hasTicket,
     ticketId: result.ticket?.id ?? null,
+    ticketIds: result.tickets.map((t) => t.id),
+    ticketsIssuedThisCall: result.newlyIssuedTickets.map((t) => t.id),
     telegramUserId: result.telegramUserId
   });
 });

@@ -2,10 +2,12 @@ import { eq } from "drizzle-orm";
 import { config } from "../../config";
 import { db } from "../../db/client";
 import { orders, receiptSubmissions } from "../../db/schema";
-import { issueTicketForApprovedOrder } from "../tickets/service";
+import { issueTicketsForApprovedOrder } from "../tickets/service";
 import { approveReceiptSubmission } from "./approveSubmission";
 import { logReceiptVerify } from "./verifyLogging";
 import { resolveReceiptVerification } from "./verifier";
+
+type TicketRow = Awaited<ReturnType<typeof issueTicketsForApprovedOrder>>["tickets"][number];
 
 export type ReverifyTelebirrResult =
   | {
@@ -13,7 +15,12 @@ export type ReverifyTelebirrResult =
       receiptId: string;
       orderRef: string;
       verificationNotes: string;
-      ticket: Awaited<ReturnType<typeof issueTicketForApprovedOrder>> | null;
+      /** All ticket rows for this order after issuance */
+      tickets: TicketRow[];
+      /** Tickets created or filled in by this call */
+      newlyIssuedTickets: TicketRow[];
+      /** First ticket; kept for older clients */
+      ticket: TicketRow | null;
       telegramUserId: string | null;
       hasTicket: boolean;
     }
@@ -100,6 +107,8 @@ export async function reverifyReceiptWithTelebirrApi(params: {
       receiptId: receipt.id,
       orderRef: freshOrder.orderRef,
       verificationNotes: verifyResult.notes,
+      tickets: [],
+      newlyIssuedTickets: [],
       ticket: null,
       telegramUserId: null,
       hasTicket: false
@@ -107,11 +116,11 @@ export async function reverifyReceiptWithTelebirrApi(params: {
   }
 
   try {
-    const ticket = await issueTicketForApprovedOrder(freshOrder.orderRef, tgId);
+    const issued = await issueTicketsForApprovedOrder(freshOrder.orderRef, tgId);
     logReceiptVerify("admin_reverify_ok_ticket", {
       receiptId: receipt.id,
       orderRef: freshOrder.orderRef,
-      ticketId: ticket.id,
+      ticketIds: issued.newlyIssued.map((t) => t.id),
       telegramUserId: tgId
     });
     return {
@@ -119,9 +128,11 @@ export async function reverifyReceiptWithTelebirrApi(params: {
       receiptId: receipt.id,
       orderRef: freshOrder.orderRef,
       verificationNotes: verifyResult.notes,
-      ticket,
+      tickets: issued.tickets,
+      newlyIssuedTickets: issued.newlyIssued,
+      ticket: issued.tickets[0] ?? null,
       telegramUserId: tgId,
-      hasTicket: true
+      hasTicket: issued.tickets.length > 0
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -135,6 +146,8 @@ export async function reverifyReceiptWithTelebirrApi(params: {
       receiptId: receipt.id,
       orderRef: freshOrder.orderRef,
       verificationNotes: `${verifyResult.notes} (ticket issue failed: ${msg})`,
+      tickets: [],
+      newlyIssuedTickets: [],
       ticket: null,
       telegramUserId: tgId,
       hasTicket: false

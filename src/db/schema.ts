@@ -85,6 +85,8 @@ export const orders = pgTable("orders", {
   payerPhone: varchar("payer_phone", { length: 20 }),
   /** Set when user interacts via Telegram user bot — used for /start auto-claim */
   telegramUserId: varchar("telegram_user_id", { length: 50 }),
+  /** Number of QR tickets for this order (same tier); expectedAmount is unit price × quantity */
+  quantity: integer("quantity").default(1).notNull(),
   status: orderStatusEnum("status").default("pending_receipt").notNull(),
   createdAt: now,
   updatedAt
@@ -111,8 +113,7 @@ export const tickets = pgTable("tickets", {
   id: uuid("id").defaultRandom().primaryKey(),
   orderId: uuid("order_id")
     .notNull()
-    .references(() => orders.id, { onDelete: "cascade" })
-    .unique(),
+    .references(() => orders.id, { onDelete: "cascade" }),
   telegramUserId: varchar("telegram_user_id", { length: 50 }).notNull(),
   /** From Telegram at claim time; null if hidden or HTTP claim without username */
   telegramUsername: varchar("telegram_username", { length: 64 }),
