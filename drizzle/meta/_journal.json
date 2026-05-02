@@ -36,6 +36,13 @@
       "when": 1777710942725,
       "tag": "0004_events_featured",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1777711681520,
+      "tag": "0005_careless_triton",
+      "breakpoints": true
     }
   ]
 }

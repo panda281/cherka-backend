@@ -114,6 +114,8 @@ export const tickets = pgTable("tickets", {
     .references(() => orders.id, { onDelete: "cascade" })
     .unique(),
   telegramUserId: varchar("telegram_user_id", { length: 50 }).notNull(),
+  /** From Telegram at claim time; null if hidden or HTTP claim without username */
+  telegramUsername: varchar("telegram_username", { length: 64 }),
   tokenJti: varchar("token_jti", { length: 100 }).notNull().unique(),
   qrPayload: text("qr_payload").notNull(),
   qrImageDataUrl: text("qr_image_data_url").notNull(),

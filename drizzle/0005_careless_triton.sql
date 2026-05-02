@@ -1,0 +1,1 @@
+ALTER TABLE "tickets" ADD COLUMN "telegram_username" varchar(64);

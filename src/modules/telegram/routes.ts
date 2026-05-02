@@ -240,6 +240,7 @@ if (config.telegramAdminBotToken) {
         tierName: eventTiers.tierName,
         orderRef: orders.orderRef,
         telegramUserId: tickets.telegramUserId,
+        telegramUsername: tickets.telegramUsername,
         ticketStatus: tickets.status
       })
       .from(tickets)
@@ -251,10 +252,14 @@ if (config.telegramAdminBotToken) {
       await adminBot!.telegram.sendMessage(chatId, `No issued tickets yet for “${eventItem.name}”.`);
       return;
     }
-    const header = `Ticket holders — ${eventItem.name}\n${issuedRows.length} issued (tier · order ref · buyer Telegram ID · status)\n`;
-    const lines = issuedRows.map(
-      (r) => `${r.tierName} (${r.tierCode}) · ${r.orderRef} · ${r.telegramUserId} · ${r.ticketStatus}`
-    );
+    const header = `Ticket holders — ${eventItem.name}\n${issuedRows.length} issued (tier · order ref · buyer @username / id · status)\n`;
+    const lines = issuedRows.map((r) => {
+      const buyer =
+        r.telegramUsername && r.telegramUsername.length > 0
+          ? `@${r.telegramUsername} (${r.telegramUserId})`
+          : r.telegramUserId;
+      return `${r.tierName} (${r.tierCode}) · ${r.orderRef} · ${buyer} · ${r.ticketStatus}`;
+    });
     const full = `${header}${lines.join("\n")}`;
     let offset = 0;
     while (offset < full.length) {
@@ -1218,7 +1223,9 @@ if (config.telegramUserBotToken) {
     const first = row[0];
     if (!first) return false;
     try {
-      const ticket = await issueTicketForApprovedOrder(first.orderRef, tgId);
+      const ticket = await issueTicketForApprovedOrder(first.orderRef, tgId, {
+        telegramUsername: ctx.from?.username
+      });
       await replyWithIssuedTicket(ctx, first.orderRef, ticket);
       await ctx.reply(
         "/start claimed your ticket automatically — this Telegram account is linked to that order.",
@@ -1236,7 +1243,9 @@ if (config.telegramUserBotToken) {
     if (deepRef) {
       await db.update(orders).set({ telegramUserId: tgId, updatedAt: new Date() }).where(eq(orders.orderRef, deepRef));
       try {
-        const ticket = await issueTicketForApprovedOrder(deepRef, tgId);
+        const ticket = await issueTicketForApprovedOrder(deepRef, tgId, {
+          telegramUsername: ctx.from?.username
+        });
         await replyWithIssuedTicket(ctx, deepRef, ticket);
         await ctx.reply(
           "Tip: share a deep link with ?start=" + deepRef + " so guests open the bot and get this QR in one step.",
@@ -1405,7 +1414,9 @@ if (config.telegramUserBotToken) {
 
     if (autoApproved) {
       try {
-        const ticket = await issueTicketForApprovedOrder(orderRef, String(ctx.from!.id));
+        const ticket = await issueTicketForApprovedOrder(orderRef, String(ctx.from!.id), {
+          telegramUsername: ctx.from?.username
+        });
         logReceiptVerify("telegram_submit_qr_ok", { orderRef, ticketId: ticket.id });
         await replyWithIssuedTicket(ctx, orderRef, ticket);
         await ctx.reply("Receipt auto-approved — your QR is above. Use /menu for more.", userMenu);
@@ -1496,7 +1507,9 @@ if (config.telegramUserBotToken) {
       .set({ telegramUserId: String(ctx.from!.id), updatedAt: new Date() })
       .where(eq(orders.orderRef, orderRef));
     try {
-      const ticket = await issueTicketForApprovedOrder(orderRef, String(ctx.from.id));
+      const ticket = await issueTicketForApprovedOrder(orderRef, String(ctx.from.id), {
+        telegramUsername: ctx.from?.username
+      });
       await replyWithIssuedTicket(ctx, orderRef, ticket);
     } catch (error) {
       await ctx.reply(error instanceof Error ? error.message : "Unable to claim ticket.");
@@ -1562,13 +1575,18 @@ telegramRouter.post("/telegram/user/webhook", async (req, res) => {
 telegramRouter.post("/telegram/user/claim", async (req, res) => {
   const orderRef = String(req.body.orderRef ?? "");
   const telegramUserId = String(req.body.telegramUserId ?? "");
+  const telegramUsernameRaw = req.body.telegramUsername;
+  const telegramUsername =
+    telegramUsernameRaw != null && String(telegramUsernameRaw).trim() !== ""
+      ? String(telegramUsernameRaw).trim().replace(/^@/, "")
+      : undefined;
   if (!orderRef || !telegramUserId) {
     res.status(400).json({ error: "orderRef and telegramUserId are required." });
     return;
   }
 
   try {
-    const ticket = await issueTicketForApprovedOrder(orderRef, telegramUserId);
+    const ticket = await issueTicketForApprovedOrder(orderRef, telegramUserId, { telegramUsername });
     res.json({ ticket });
   } catch (error) {
     res.status(422).json({ error: error instanceof Error ? error.message : "Claim failed." });

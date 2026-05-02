@@ -39,12 +39,8 @@ function ethioReceiverMatches(apiValue: string, configuredReceiver: string): boo
   return tail(a) === tail(b);
 }
 
+/** Telebirr API: compare order total to `data.amount` only (not `total_paid`). */
 function paidAmountFromTelebirrData(data: Record<string, unknown>): number | null {
-  const total = data.total_paid;
-  if (total != null && total !== "") {
-    const n = Number(total);
-    if (Number.isFinite(n)) return n;
-  }
   const amt = data.amount;
   if (amt != null && amt !== "") {
     const n = Number(amt);
@@ -146,20 +142,25 @@ export class ParserReceiptVerifier implements ReceiptVerifier {
 
       const paid = paidAmountFromTelebirrData(data);
       if (paid == null) {
-        return { ok: false, mode: "parser", notes: "Verify API: could not read paid amount from receipt.", receiptUrl };
+        return {
+          ok: false,
+          mode: "parser",
+          notes: "Verify API: missing or invalid `data.amount` on receipt (total_paid is not used).",
+          receiptUrl
+        };
       }
 
       const expected = input.expectedAmount;
       if (Math.abs(paid - expected) > 0.02) {
         logReceiptVerify("telebirr_api_amount_mismatch", {
           receiptNo: input.receiptNo,
-          paid,
+          receiptAmountField: paid,
           expectedOrderAmount: expected
         });
         return {
           ok: false,
           mode: "parser",
-          notes: `Amount mismatch: receipt shows ${paid} ETB, order expects ${expected} ETB.`,
+          notes: `Amount mismatch: receipt \`amount\` is ${paid} ETB, order expects ${expected} ETB.`,
           receiptUrl
         };
       }
@@ -197,7 +198,7 @@ export class ParserReceiptVerifier implements ReceiptVerifier {
 
       logReceiptVerify("telebirr_api_auto_approve_ok", {
         receiptNo: input.receiptNo,
-        paid,
+        amountField: paid,
         expectedAmount: input.expectedAmount,
         payer
       });

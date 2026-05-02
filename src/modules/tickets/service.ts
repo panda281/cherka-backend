@@ -6,7 +6,11 @@ import { db } from "../../db/client";
 import { config } from "../../config";
 import { auditLogs, orders, tickets } from "../../db/schema";
 
-export async function issueTicketForApprovedOrder(orderRef: string, telegramUserId: string) {
+export async function issueTicketForApprovedOrder(
+  orderRef: string,
+  telegramUserId: string,
+  opts?: { telegramUsername?: string | null }
+) {
   return db.transaction(async (tx) => {
     const order = await tx.query.orders.findFirst({
       where: eq(orders.orderRef, orderRef)
@@ -39,11 +43,17 @@ export async function issueTicketForApprovedOrder(orderRef: string, telegramUser
     const qrPayload = jwt.sign(payload, config.jwtSecret, { expiresIn: "14d" });
     const qrImageDataUrl = await QRCode.toDataURL(qrPayload, { errorCorrectionLevel: "M" });
 
+    const username =
+      opts?.telegramUsername != null && opts.telegramUsername !== ""
+        ? opts.telegramUsername
+        : null;
+
     const [created] = await tx
       .insert(tickets)
       .values({
         orderId: order.id,
         telegramUserId,
+        telegramUsername: username,
         tokenJti,
         qrPayload,
         qrImageDataUrl,
