@@ -39,8 +39,20 @@ function getArgs(text: string): string[] {
 const RECEIPT_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Telegram limits callback_data to 64 bytes — use compact payloads (tier/event id only + short codes). */
+/** Telegram limits callback_data to 64 bytes (UTF-8). https://core.telegram.org/bots/api#inlinekeyboardbutton */
 const CB_UUID = "([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})";
+
+const textEncoder = new TextEncoder();
+
+function telegramCallbackData(payload: string): string {
+  const n = textEncoder.encode(payload).length;
+  if (n > 64) {
+    throw new Error(`callback_data exceeds 64 UTF-8 bytes (got ${n}): ${payload.slice(0, 80)}`);
+  }
+  return payload;
+}
+
+/** Admin menu / nav: nw | lst | vq | cmd. Event: evd eat eem edo + UUID. Tier: t_edit t_tgl t_f. Event fields: e_f. User menu: user_buy … */
 
 const TIER_FIELD_BY_CODE: Record<string, AdminTierEditState["field"]> = {
   c: "tierCode",
@@ -176,8 +188,11 @@ if (config.telegramAdminBotToken) {
 
     const tierButtons = tiers.flatMap((tier) => [
       [
-        Markup.button.callback(`Edit ${tier.tierCode}`, `t_edit:${tier.id}`),
-        Markup.button.callback(tier.active ? `Deactivate ${tier.tierCode}` : `Activate ${tier.tierCode}`, `t_tgl:${tier.id}`)
+        Markup.button.callback(`Edit ${tier.tierCode}`, telegramCallbackData(`t_edit:${tier.id}`)),
+        Markup.button.callback(
+          tier.active ? `Deactivate ${tier.tierCode}` : `Activate ${tier.tierCode}`,
+          telegramCallbackData(`t_tgl:${tier.id}`)
+        )
       ]
     ]);
 
@@ -185,18 +200,21 @@ if (config.telegramAdminBotToken) {
       chatId,
       `Event: ${eventItem.name}\nCategory: ${eventItem.category}\nStatus: ${eventItem.status}\nStart: ${eventItem.startsAt.toISOString()}\nEnd: ${eventItem.endsAt.toISOString()}\nLocation: ${eventItem.location ?? "-"}\nEvent image: ${eventItem.eventImageUrl ?? "-"}\nTicket template image: ${eventItem.ticketTemplateImageUrl ?? "-"}\n\nTiers:\n${tiersText}`,
       Markup.inlineKeyboard([
-        [Markup.button.callback("Add Tier", `admin_event_add_tier:${eventId}`), Markup.button.callback("Edit Event", `admin_event_edit:${eventId}`)],
+        [
+          Markup.button.callback("Add Tier", telegramCallbackData(`eat:${eventId}`)),
+          Markup.button.callback("Edit Event", telegramCallbackData(`eem:${eventId}`))
+        ],
         ...tierButtons,
-        [Markup.button.callback("Back to Event List", "admin_event_list")]
+        [Markup.button.callback("Back to Event List", telegramCallbackData("lst"))]
       ])
     );
   }
 
   const adminMenu = Markup.inlineKeyboard([
-    [Markup.button.callback("Create New Event", "admin_create_event_start")],
-    [Markup.button.callback("Event List", "admin_event_list")],
-    [Markup.button.callback("View Verify Queue", "admin_verifyqueue")],
-    [Markup.button.callback("Show Commands", "admin_show_commands")]
+    [Markup.button.callback("Create New Event", telegramCallbackData("nw"))],
+    [Markup.button.callback("Event List", telegramCallbackData("lst"))],
+    [Markup.button.callback("View Verify Queue", telegramCallbackData("vq"))],
+    [Markup.button.callback("Show Commands", telegramCallbackData("cmd"))]
   ]);
 
   adminBot.start(async (ctx) => {
@@ -215,7 +233,7 @@ if (config.telegramAdminBotToken) {
     await ctx.reply("Admin quick actions:", adminMenu);
   });
 
-  adminBot.action("admin_create_event_start", async (ctx) => {
+  adminBot.action("nw", async (ctx) => {
     if (!isAdminUser(String(ctx.from.id))) {
       await ctx.answerCbQuery("Unauthorized");
       return;
@@ -225,7 +243,7 @@ if (config.telegramAdminBotToken) {
     await ctx.reply("Creating new event.\nStep 1/11: send event name.");
   });
 
-  adminBot.action("admin_event_list", async (ctx) => {
+  adminBot.action("lst", async (ctx) => {
     if (!isAdminUser(String(ctx.from.id))) {
       await ctx.answerCbQuery("Unauthorized");
       return;
@@ -240,12 +258,12 @@ if (config.telegramAdminBotToken) {
       return;
     }
     const keyboard = rows.map((eventItem) => [
-      Markup.button.callback(eventItem.name.slice(0, 50), `admin_event_detail:${eventItem.id}`)
+      Markup.button.callback(eventItem.name.slice(0, 50), telegramCallbackData(`evd:${eventItem.id}`))
     ]);
     await ctx.reply("Select event:", Markup.inlineKeyboard(keyboard));
   });
 
-  adminBot.action(/admin_event_detail:(.+)/, async (ctx) => {
+  adminBot.action(new RegExp(`^evd:${CB_UUID}$`), async (ctx) => {
     if (!isAdminUser(String(ctx.from.id))) {
       await ctx.answerCbQuery("Unauthorized");
       return;
@@ -255,7 +273,7 @@ if (config.telegramAdminBotToken) {
     await sendEventDetail(ctx.chat!.id, eventId);
   });
 
-  adminBot.action(/admin_event_add_tier:(.+)/, async (ctx) => {
+  adminBot.action(new RegExp(`^eat:${CB_UUID}$`), async (ctx) => {
     if (!isAdminUser(String(ctx.from.id))) {
       await ctx.answerCbQuery("Unauthorized");
       return;
@@ -307,9 +325,15 @@ if (config.telegramAdminBotToken) {
     await ctx.reply(
       "Choose tier field to edit:",
       Markup.inlineKeyboard([
-        [Markup.button.callback("Code", `t_f:${tierId}:c`), Markup.button.callback("Name", `t_f:${tierId}:n`)],
-        [Markup.button.callback("Price", `t_f:${tierId}:p`), Markup.button.callback("Capacity", `t_f:${tierId}:k`)],
-        [Markup.button.callback("Back", `admin_event_detail:${eventId}`)]
+        [
+          Markup.button.callback("Code", telegramCallbackData(`t_f:${tierId}:c`)),
+          Markup.button.callback("Name", telegramCallbackData(`t_f:${tierId}:n`))
+        ],
+        [
+          Markup.button.callback("Price", telegramCallbackData(`t_f:${tierId}:p`)),
+          Markup.button.callback("Capacity", telegramCallbackData(`t_f:${tierId}:k`))
+        ],
+        [Markup.button.callback("Back", telegramCallbackData(`evd:${eventId}`))]
       ])
     );
   });
@@ -343,7 +367,7 @@ if (config.telegramAdminBotToken) {
     await ctx.reply(`Send new value for ${field}. For capacity you can send skip for unlimited.`);
   });
 
-  adminBot.action(/admin_event_edit:(.+)/, async (ctx) => {
+  adminBot.action(new RegExp(`^eem:${CB_UUID}$`), async (ctx) => {
     if (!isAdminUser(String(ctx.from.id))) {
       await ctx.answerCbQuery("Unauthorized");
       return;
@@ -353,12 +377,24 @@ if (config.telegramAdminBotToken) {
     await ctx.reply(
       "Choose field to edit:",
       Markup.inlineKeyboard([
-        [Markup.button.callback("Name", `e_f:${eventId}:n`), Markup.button.callback("Start Date", `e_f:${eventId}:s`)],
-        [Markup.button.callback("End Date", `e_f:${eventId}:e`), Markup.button.callback("Location", `e_f:${eventId}:l`)],
-        [Markup.button.callback("Description", `e_f:${eventId}:d`), Markup.button.callback("Category", `e_f:${eventId}:c`)],
-        [Markup.button.callback("Status", `e_f:${eventId}:t`), Markup.button.callback("Event Image URL", `e_f:${eventId}:i`)],
-        [Markup.button.callback("Ticket Template URL", `e_f:${eventId}:m`)],
-        [Markup.button.callback("Done", `admin_edit_done:${eventId}`)]
+        [
+          Markup.button.callback("Name", telegramCallbackData(`e_f:${eventId}:n`)),
+          Markup.button.callback("Start Date", telegramCallbackData(`e_f:${eventId}:s`))
+        ],
+        [
+          Markup.button.callback("End Date", telegramCallbackData(`e_f:${eventId}:e`)),
+          Markup.button.callback("Location", telegramCallbackData(`e_f:${eventId}:l`))
+        ],
+        [
+          Markup.button.callback("Description", telegramCallbackData(`e_f:${eventId}:d`)),
+          Markup.button.callback("Category", telegramCallbackData(`e_f:${eventId}:c`))
+        ],
+        [
+          Markup.button.callback("Status", telegramCallbackData(`e_f:${eventId}:t`)),
+          Markup.button.callback("Event Image URL", telegramCallbackData(`e_f:${eventId}:i`))
+        ],
+        [Markup.button.callback("Ticket Template URL", telegramCallbackData(`e_f:${eventId}:m`))],
+        [Markup.button.callback("Done", telegramCallbackData(`edo:${eventId}`))]
       ])
     );
   });
@@ -380,7 +416,7 @@ if (config.telegramAdminBotToken) {
     await ctx.reply(`Send new value for ${field}. For image fields you can send URL, upload photo, or type skip.`);
   });
 
-  adminBot.action(/admin_edit_done:(.+)/, async (ctx) => {
+  adminBot.action(new RegExp(`^edo:${CB_UUID}$`), async (ctx) => {
     if (!isAdminUser(String(ctx.from.id))) {
       await ctx.answerCbQuery("Unauthorized");
       return;
@@ -390,7 +426,7 @@ if (config.telegramAdminBotToken) {
     await sendEventDetail(ctx.chat!.id, ctx.match[1]);
   });
 
-  adminBot.action("admin_verifyqueue", async (ctx) => {
+  adminBot.action("vq", async (ctx) => {
     if (!isAdminUser(String(ctx.from.id))) {
       await ctx.answerCbQuery("Unauthorized");
       return;
@@ -411,7 +447,7 @@ if (config.telegramAdminBotToken) {
     await ctx.reply(text);
   });
 
-  adminBot.action("admin_show_commands", async (ctx) => {
+  adminBot.action("cmd", async (ctx) => {
     if (!isAdminUser(String(ctx.from.id))) {
       await ctx.answerCbQuery("Unauthorized");
       return;
@@ -436,7 +472,7 @@ if (config.telegramAdminBotToken) {
       return;
     }
     const keyboard = rows.map((eventItem) => [
-      Markup.button.callback(eventItem.name.slice(0, 50), `admin_event_detail:${eventItem.id}`)
+      Markup.button.callback(eventItem.name.slice(0, 50), telegramCallbackData(`evd:${eventItem.id}`))
     ]);
     await ctx.reply("Select event:", Markup.inlineKeyboard(keyboard));
   });
@@ -985,10 +1021,10 @@ if (config.telegramUserBotToken) {
   userBot = new Telegraf(config.telegramUserBotToken);
 
   const userMenu = Markup.inlineKeyboard([
-    [Markup.button.callback("Browse Events", "user_buy")],
-    [Markup.button.callback("Submit Receipt Help", "user_submit_help")],
-    [Markup.button.callback("Claim Ticket Help", "user_claim_help")],
-    [Markup.button.callback("My Tickets", "user_myticket")]
+    [Markup.button.callback("Browse Events", telegramCallbackData("user_buy"))],
+    [Markup.button.callback("Submit Receipt Help", telegramCallbackData("user_submit_help"))],
+    [Markup.button.callback("Claim Ticket Help", telegramCallbackData("user_claim_help"))],
+    [Markup.button.callback("My Tickets", telegramCallbackData("user_myticket"))]
   ]);
 
   userBot.start(async (ctx) => {
