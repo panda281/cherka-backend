@@ -9,6 +9,7 @@ import { eventTiers, orders, receiptSubmissions } from "../../db/schema";
 import { config } from "../../config";
 import { buildOrderRef, buildReceiptUrl, sha256 } from "../../utils";
 import { approveReceiptSubmission } from "../receipts/approveSubmission";
+import { logReceiptVerify } from "../receipts/verifyLogging";
 import { resolveReceiptVerification } from "../receipts/verifier";
 import { rateLimit } from "../../middleware/rateLimit";
 
@@ -115,10 +116,24 @@ ordersRouter.post("/orders/:orderId/receipt", rateLimit(8, 10 * 60 * 1000), uplo
       verificationNotes: result.notes,
       auditMetadata: { orderId: order.id, source: "telebirr_verify_api" }
     });
+    logReceiptVerify("http_receipt_auto_approve", {
+      orderId: order.id,
+      orderRef: order.orderRef,
+      receiptId: receiptRow.id,
+      approveOk: approved.ok,
+      ...(!approved.ok && "error" in approved ? { approveError: approved.error } : {})
+    });
     if (approved.ok) {
       receiptRow = approved.receipt;
       orderRow = approved.order;
     }
+  } else {
+    logReceiptVerify("http_receipt_queue_manual", {
+      orderId: order.id,
+      orderRef: order.orderRef,
+      ok: result.ok,
+      notes: result.notes.slice(0, 300)
+    });
   }
 
   res.status(201).json({

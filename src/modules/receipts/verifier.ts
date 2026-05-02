@@ -1,5 +1,6 @@
 import { config } from "../../config";
 import { buildReceiptUrl } from "../../utils";
+import { logReceiptVerify } from "./verifyLogging";
 
 export type ReceiptVerificationInput = {
   receiptNo: string;
@@ -78,6 +79,18 @@ export class ParserReceiptVerifier implements ReceiptVerifier {
     }
 
     try {
+      logReceiptVerify("telebirr_api_request", {
+        receiptNo: input.receiptNo,
+        expectedAmount: input.expectedAmount,
+        urlHost: (() => {
+          try {
+            return new URL(url).host;
+          } catch {
+            return "invalid-url";
+          }
+        })()
+      });
+
       const response = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
@@ -103,6 +116,11 @@ export class ParserReceiptVerifier implements ReceiptVerifier {
           typeof json === "object" && json !== null && "detail" in json
             ? String((json as { detail: unknown }).detail)
             : rawText.slice(0, 500);
+        logReceiptVerify("telebirr_api_http_error", {
+          receiptNo: input.receiptNo,
+          httpStatus: response.status,
+          detail: detail.slice(0, 400)
+        });
         return {
           ok: false,
           mode: "parser",
@@ -133,6 +151,11 @@ export class ParserReceiptVerifier implements ReceiptVerifier {
 
       const expected = input.expectedAmount;
       if (Math.abs(paid - expected) > 0.02) {
+        logReceiptVerify("telebirr_api_amount_mismatch", {
+          receiptNo: input.receiptNo,
+          paid,
+          expectedOrderAmount: expected
+        });
         return {
           ok: false,
           mode: "parser",
@@ -152,6 +175,11 @@ export class ParserReceiptVerifier implements ReceiptVerifier {
         hasCredited &&
         !ethioReceiverMatches(String(creditedRaw), input.receiverNumber)
       ) {
+        logReceiptVerify("telebirr_api_receiver_mismatch", {
+          receiptNo: input.receiptNo,
+          creditedParty: String(creditedRaw),
+          expectedReceiver: input.receiverNumber
+        });
         return {
           ok: false,
           mode: "parser",
@@ -167,6 +195,12 @@ export class ParserReceiptVerifier implements ReceiptVerifier {
             ? data.payer_phone
             : "unknown";
 
+      logReceiptVerify("telebirr_api_auto_approve_ok", {
+        receiptNo: input.receiptNo,
+        paid,
+        expectedAmount: input.expectedAmount,
+        payer
+      });
       return {
         ok: true,
         mode: "parser",
@@ -175,6 +209,7 @@ export class ParserReceiptVerifier implements ReceiptVerifier {
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      logReceiptVerify("telebirr_api_exception", { receiptNo: input.receiptNo, error: msg });
       return {
         ok: false,
         mode: "parser",
@@ -198,7 +233,26 @@ export async function resolveReceiptVerification(
   options: { skipExternalApi?: boolean } = {}
 ): Promise<ReceiptVerificationResult> {
   if (options.skipExternalApi || !config.receiptVerifyTelebirrUrl) {
-    return new ManualReceiptVerifier().verify(input);
+    logReceiptVerify("verify_skip_external_api", {
+      receiptNo: input.receiptNo,
+      skipExternalApi: Boolean(options.skipExternalApi),
+      hasVerifyUrl: Boolean(config.receiptVerifyTelebirrUrl)
+    });
+    const manual = await new ManualReceiptVerifier().verify(input);
+    logReceiptVerify("verify_resolve_result", {
+      receiptNo: input.receiptNo,
+      ok: manual.ok,
+      mode: manual.mode,
+      notes: manual.notes.slice(0, 500)
+    });
+    return manual;
   }
-  return new ParserReceiptVerifier().verify(input);
+  const result = await new ParserReceiptVerifier().verify(input);
+  logReceiptVerify("verify_resolve_result", {
+    receiptNo: input.receiptNo,
+    ok: result.ok,
+    mode: result.mode,
+    notes: result.notes.slice(0, 500)
+  });
+  return result;
 }

@@ -8,6 +8,7 @@ import { db } from "../../db/client";
 import { eventTiers, events, orders, receiptSubmissions, tickets } from "../../db/schema";
 import { buildReceiptUrl } from "../../utils";
 import { approveReceiptSubmission } from "../receipts/approveSubmission";
+import { logReceiptVerify } from "../receipts/verifyLogging";
 import { resolveReceiptVerification } from "../receipts/verifier";
 import { issueTicketForApprovedOrder } from "../tickets/service";
 
@@ -187,36 +188,14 @@ if (config.telegramAdminBotToken) {
           .join("\n")
       : "No tiers configured.";
 
-    const issuedRows = await db
-      .select({
-        tierCode: eventTiers.tierCode,
-        tierName: eventTiers.tierName,
-        orderRef: orders.orderRef,
-        telegramUserId: tickets.telegramUserId,
-        ticketStatus: tickets.status
-      })
+    const [issuedRow] = await db
+      .select({ n: sql<number>`count(*)::int` })
       .from(tickets)
       .innerJoin(orders, eq(tickets.orderId, orders.id))
-      .innerJoin(eventTiers, eq(orders.tierId, eventTiers.id))
-      .where(eq(orders.eventId, eventId))
-      .orderBy(desc(tickets.createdAt));
+      .where(eq(orders.eventId, eventId));
+    const issuedCount = issuedRow?.n ?? 0;
 
-    const salesDetail =
-      issuedRows.length === 0
-        ? "Issued tickets: none yet."
-        : [
-            `Issued tickets (${issuedRows.length}) — tier · order · buyer Telegram ID · status`,
-            ...issuedRows.slice(0, 30).map(
-              (r) =>
-                `- ${r.tierName} (${r.tierCode}) · ${r.orderRef} · ${r.telegramUserId} · ${r.ticketStatus}`
-            ),
-            ...(issuedRows.length > 30 ? [`… +${issuedRows.length - 30} more (export DB for full list)`] : [])
-          ].join("\n");
-
-    let detailBody = `Event: ${eventItem.name}\nCategory: ${eventItem.category}\nStatus: ${eventItem.status}\nStart: ${eventItem.startsAt.toISOString()}\nEnd: ${eventItem.endsAt.toISOString()}\nLocation: ${eventItem.location ?? "-"}\nEvent image: ${eventItem.eventImageUrl ?? "-"}\nTicket template image: ${eventItem.ticketTemplateImageUrl ?? "-"}\n\nTiers:\n${tiersText}\n\n${salesDetail}`;
-    if (detailBody.length > 3900) {
-      detailBody = `${detailBody.slice(0, 3880)}\n… (message truncated)`;
-    }
+    const detailBody = `Event: ${eventItem.name}\nCategory: ${eventItem.category}\nStatus: ${eventItem.status}\nStart: ${eventItem.startsAt.toISOString()}\nEnd: ${eventItem.endsAt.toISOString()}\nLocation: ${eventItem.location ?? "-"}\nEvent image: ${eventItem.eventImageUrl ?? "-"}\nTicket template image: ${eventItem.ticketTemplateImageUrl ?? "-"}\n\nTiers:\n${tiersText}\n\nIssued tickets: ${issuedCount} — use the “Ticket holders” button below for the full list.`;
 
     const tierButtons = tiers.flatMap((tier) => [
       [
@@ -236,10 +215,53 @@ if (config.telegramAdminBotToken) {
           Markup.button.callback("Add Tier", telegramCallbackData(`eat:${eventId}`)),
           Markup.button.callback("Edit Event", telegramCallbackData(`eem:${eventId}`))
         ],
+        [Markup.button.callback("Ticket holders", telegramCallbackData(`sls:${eventId}`))],
         ...tierButtons,
         [Markup.button.callback("Back to Event List", telegramCallbackData("lst"))]
       ])
     );
+  }
+
+  async function sendEventTicketHoldersList(chatId: number, eventId: string) {
+    const eventItem = await db.query.events.findFirst({
+      where: eq(events.id, eventId)
+    });
+    if (!eventItem) {
+      await adminBot!.telegram.sendMessage(chatId, "Event not found.");
+      return;
+    }
+    const issuedRows = await db
+      .select({
+        tierCode: eventTiers.tierCode,
+        tierName: eventTiers.tierName,
+        orderRef: orders.orderRef,
+        telegramUserId: tickets.telegramUserId,
+        ticketStatus: tickets.status
+      })
+      .from(tickets)
+      .innerJoin(orders, eq(tickets.orderId, orders.id))
+      .innerJoin(eventTiers, eq(orders.tierId, eventTiers.id))
+      .where(eq(orders.eventId, eventId))
+      .orderBy(desc(tickets.createdAt));
+    if (!issuedRows.length) {
+      await adminBot!.telegram.sendMessage(chatId, `No issued tickets yet for “${eventItem.name}”.`);
+      return;
+    }
+    const header = `Ticket holders — ${eventItem.name}\n${issuedRows.length} issued (tier · order ref · buyer Telegram ID · status)\n`;
+    const lines = issuedRows.map(
+      (r) => `${r.tierName} (${r.tierCode}) · ${r.orderRef} · ${r.telegramUserId} · ${r.ticketStatus}`
+    );
+    const full = `${header}${lines.join("\n")}`;
+    let offset = 0;
+    while (offset < full.length) {
+      let end = Math.min(offset + 3800, full.length);
+      if (end < full.length) {
+        const cut = full.lastIndexOf("\n", end);
+        if (cut > offset) end = cut;
+      }
+      await adminBot!.telegram.sendMessage(chatId, full.slice(offset, end).trimEnd());
+      offset = end + 1;
+    }
   }
 
   const adminMenu = Markup.inlineKeyboard([
@@ -303,6 +325,16 @@ if (config.telegramAdminBotToken) {
     await ctx.answerCbQuery();
     const eventId = ctx.match[1];
     await sendEventDetail(ctx.chat!.id, eventId);
+  });
+
+  adminBot.action(new RegExp(`^sls:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    const eventId = ctx.match[1];
+    await sendEventTicketHoldersList(ctx.chat!.id, eventId);
   });
 
   adminBot.action(new RegExp(`^eat:${CB_UUID}$`), async (ctx) => {
@@ -1241,6 +1273,13 @@ if (config.telegramUserBotToken) {
       receiverNumber: config.telebirrReceiver,
       receiverName: config.telebirrReceiverName
     });
+    logReceiptVerify("telegram_submit_verifier_done", {
+      orderRef,
+      orderId: order.id,
+      verifyOk: verifyResult.ok,
+      mode: verifyResult.mode,
+      notes: verifyResult.notes.slice(0, 400)
+    });
 
     const [inserted] = await db
       .insert(receiptSubmissions)
@@ -1263,15 +1302,26 @@ if (config.telegramUserBotToken) {
         auditMetadata: { orderId: order.id, source: "telebirr_verify_api", channel: "telegram" }
       });
       autoApproved = approved.ok;
+      logReceiptVerify("telegram_submit_auto_approve_db", {
+        orderRef,
+        receiptSubmissionId: inserted.id,
+        approveOk: approved.ok,
+        ...(!approved.ok && "error" in approved ? { approveError: approved.error } : {})
+      });
     }
 
     if (autoApproved) {
       try {
         const ticket = await issueTicketForApprovedOrder(orderRef, String(ctx.from!.id));
+        logReceiptVerify("telegram_submit_qr_ok", { orderRef, ticketId: ticket.id });
         await replyWithIssuedTicket(ctx, orderRef, ticket);
         await ctx.reply("Receipt auto-approved — your QR is above. Use /menu for more.", userMenu);
         return;
-      } catch {
+      } catch (err) {
+        logReceiptVerify("telegram_submit_qr_fail", {
+          orderRef,
+          error: err instanceof Error ? err.message : String(err)
+        });
         await ctx.reply(
           [
             "Receipt auto-verified, but the QR could not be issued yet. Try: /claim " + orderRef,
