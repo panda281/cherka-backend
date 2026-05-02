@@ -1,10 +1,18 @@
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import jwt from "jsonwebtoken";
 import QRCode from "qrcode";
 import { randomUUID } from "node:crypto";
 import { db } from "../../db/client";
 import { config } from "../../config";
 import { auditLogs, orders, tickets } from "../../db/schema";
+
+const MAX_TICKETS_PER_ORDER = 50;
+
+function normalizedQuantity(raw: number | null | undefined): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 1;
+  return Math.min(MAX_TICKETS_PER_ORDER, Math.max(1, Math.floor(n)));
+}
 
 export type IssuedTicketsResult = {
   tickets: (typeof tickets.$inferSelect)[];
@@ -21,6 +29,8 @@ export async function issueTicketsForApprovedOrder(
   opts?: { telegramUsername?: string | null }
 ): Promise<IssuedTicketsResult> {
   return db.transaction(async (tx) => {
+    await tx.execute(sql`SELECT id FROM orders WHERE order_ref = ${orderRef} FOR UPDATE`);
+
     const order = await tx.query.orders.findFirst({
       where: eq(orders.orderRef, orderRef)
     });
@@ -32,7 +42,7 @@ export async function issueTicketsForApprovedOrder(
       throw new Error("Order is not approved yet.");
     }
 
-    const qty = Math.max(1, order.quantity);
+    const qty = normalizedQuantity(order.quantity);
 
     const existing = await tx.query.tickets.findMany({
       where: eq(tickets.orderId, order.id),

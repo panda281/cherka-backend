@@ -1492,8 +1492,7 @@ if (config.telegramUserBotToken) {
           "More than one order is waiting to be linked to Telegram.",
           "Use: /claim YOUR_ORDER_REF",
           "(Copy the order reference from your payment or confirmation page.)"
-        ].join("\n"),
-        userMenu
+        ].join("\n")
       );
       return true;
     }
@@ -1506,15 +1505,9 @@ if (config.telegramUserBotToken) {
       });
       const q = issued.tickets.length;
       await replyWithIssuedTickets(ctx, orderRef, issued.newlyIssued, q);
-      await ctx.reply(
-        issued.newlyIssued.length > 0
-          ? "Linked this chat to your order (your Telegram id from /start) and sent your ticket QR code(s) above."
-          : "Your ticket QR codes were already issued for this order. Use My Tickets.",
-        userMenu
-      );
       return true;
     } catch (e) {
-      await ctx.reply(e instanceof Error ? e.message : "Could not issue ticket yet.", userMenu);
+      await ctx.reply(e instanceof Error ? e.message : "Could not issue ticket yet.");
       return true;
     }
   }
@@ -1541,12 +1534,6 @@ if (config.telegramUserBotToken) {
       });
       const q = issued.tickets.length;
       await replyWithIssuedTickets(ctx, first.orderRef, issued.newlyIssued, q);
-      await ctx.reply(
-        issued.newlyIssued.length > 0
-          ? "/start issued your ticket QR code(s) automatically — this Telegram account is linked to that order."
-          : "Tickets for that order were already issued. Use My Tickets.",
-        userMenu
-      );
       return true;
     } catch {
       return false;
@@ -1564,13 +1551,9 @@ if (config.telegramUserBotToken) {
         });
         const q = issued.tickets.length;
         await replyWithIssuedTickets(ctx, deepRef, issued.newlyIssued, q);
-        await ctx.reply(
-          issued.newlyIssued.length > 0 ? "Your ticket QR code(s) are above." : "Tickets were already issued. Use My Tickets.",
-          userMenu
-        );
         return;
       } catch (e) {
-        await ctx.reply(e instanceof Error ? e.message : "Could not issue ticket yet.", userMenu);
+        await ctx.reply(e instanceof Error ? e.message : "Could not issue ticket yet.");
         return;
       }
     }
@@ -1702,12 +1685,6 @@ if (config.telegramUserBotToken) {
           ticketIds: issued.newlyIssued.map((t) => t.id)
         });
         await replyWithIssuedTickets(ctx, orderRef, issued.newlyIssued, q);
-        await ctx.reply(
-          issued.newlyIssued.length > 0
-            ? "Receipt auto-approved — your QR code(s) are above. Use /menu for more."
-            : "Receipt auto-approved — tickets were already issued. Use /mytickets.",
-          userMenu
-        );
         return;
       } catch (err) {
         logReceiptVerify("telegram_submit_qr_fail", {
@@ -1719,8 +1696,7 @@ if (config.telegramUserBotToken) {
             "Receipt auto-verified, but the QR could not be issued yet. Try: /claim " + orderRef,
             "",
             verifyResult.notes
-          ].join("\n"),
-          userMenu
+          ].join("\n")
         );
         return;
       }
@@ -1800,9 +1776,6 @@ if (config.telegramUserBotToken) {
       });
       const q = issued.tickets.length;
       await replyWithIssuedTickets(ctx, orderRef, issued.newlyIssued, q);
-      if (issued.newlyIssued.length === 0) {
-        await ctx.reply("Tickets were already issued for this order. Use /mytickets.", userMenu);
-      }
     } catch (error) {
       await ctx.reply(error instanceof Error ? error.message : "Unable to claim ticket.");
     }
