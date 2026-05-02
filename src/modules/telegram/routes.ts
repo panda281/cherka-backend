@@ -36,6 +36,18 @@ function getArgs(text: string): string[] {
   return text.split(" ").slice(1).filter(Boolean);
 }
 
+const RECEIPT_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Accepts raw UUID or copy-paste from verify queue like `receiptId=<uuid>`. */
+function parseReceiptIdArg(raw: string | undefined): string | null {
+  if (!raw) return null;
+  const t = raw.trim();
+  const keyVal = /^receiptId=(.+)$/i.exec(t);
+  const candidate = (keyVal ? keyVal[1] : t).trim();
+  return RECEIPT_UUID_RE.test(candidate) ? candidate : null;
+}
+
 function isAdminUser(telegramUserId: string): boolean {
   return config.adminTelegramIds.includes(telegramUserId);
 }
@@ -479,9 +491,11 @@ if (config.telegramAdminBotToken) {
       return;
     }
     const args = getArgs(getText(ctx));
-    const receiptId = args[0];
+    const receiptId = parseReceiptIdArg(args[0]);
     if (!receiptId) {
-      await ctx.reply("Usage: /approve receiptId");
+      await ctx.reply(
+        "Usage: /approve RECEIPT_UUID\nExample:\n/approve 64448a4a-6498-4a12-876b-e9234cf4bf2d\n\nYou can paste the line from /verifyqueue (receiptId=...) — it is accepted."
+      );
       return;
     }
     const receipt = await db.query.receiptSubmissions.findFirst({ where: eq(receiptSubmissions.id, receiptId) });
@@ -508,10 +522,12 @@ if (config.telegramAdminBotToken) {
       return;
     }
     const args = getArgs(getText(ctx));
-    const receiptId = args[0];
+    const receiptId = parseReceiptIdArg(args[0]);
     const reason = args.slice(1).join(" ") || "Rejected from admin bot.";
     if (!receiptId) {
-      await ctx.reply("Usage: /reject receiptId reason");
+      await ctx.reply(
+        "Usage: /reject RECEIPT_UUID reason\nExample: /reject 64448a4a-... wrong amount"
+      );
       return;
     }
     const receipt = await db.query.receiptSubmissions.findFirst({ where: eq(receiptSubmissions.id, receiptId) });
@@ -1159,8 +1175,13 @@ telegramRouter.post("/telegram/admin/webhook", async (req, res) => {
     return;
   }
 
-  await adminBot.handleUpdate(req.body);
-  res.json({ ok: true });
+  try {
+    await adminBot.handleUpdate(req.body);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[telegram admin webhook]", err);
+    res.status(500).json({ error: err instanceof Error ? err.message : "handler_error" });
+  }
 });
 
 telegramRouter.post("/telegram/user/webhook", async (req, res) => {
@@ -1175,8 +1196,13 @@ telegramRouter.post("/telegram/user/webhook", async (req, res) => {
     return;
   }
 
-  await userBot.handleUpdate(req.body);
-  res.json({ ok: true });
+  try {
+    await userBot.handleUpdate(req.body);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[telegram user webhook]", err);
+    res.status(500).json({ error: err instanceof Error ? err.message : "handler_error" });
+  }
 });
 
 telegramRouter.post("/telegram/user/claim", async (req, res) => {
