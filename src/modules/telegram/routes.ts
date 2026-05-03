@@ -143,10 +143,10 @@ function formatBrowseEventBlock(
               at.getTime() < tier.earlyBirdEndsAt.getTime() &&
               eff < reg - 1e-9;
             const priceStr = escapeMarkdownV2(eff.toFixed(2));
-            const until = tier.earlyBirdEndsAt!.toISOString().replace("T", " ").slice(0, 16);
-            const suffix = earlyOn
-              ? ` \\(${escapeMarkdownV2("early bird")} ${escapeMarkdownV2("until")} ${`\`${escapeMarkdownV2InlineCode(until)}\``}\\, ${escapeMarkdownV2("then")} ETB ${escapeMarkdownV2(reg.toFixed(2))}\\)`
-              : "";
+            const suffix =
+              earlyOn && tier.earlyBirdEndsAt != null
+                ? ` \\(${escapeMarkdownV2("early bird")} ${escapeMarkdownV2("until")} ${`\`${escapeMarkdownV2InlineCode(tier.earlyBirdEndsAt.toISOString().replace("T", " ").slice(0, 16))}\``}\\, ${escapeMarkdownV2("then")} ETB ${escapeMarkdownV2(reg.toFixed(2))}\\)`
+                : "";
             return `• ${escapeMarkdownV2(tier.tierName)} \\(${code}\\) · ETB ${priceStr}${suffix}`;
           })
           .join("\n");
