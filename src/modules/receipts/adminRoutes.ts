@@ -39,7 +39,16 @@ const rejectSchema = z.object({
 
 export const adminReceiptsRouter = express.Router();
 
-adminReceiptsRouter.use(requireScanAuth, requireStaffRole("organizer_admin"));
+/**
+ * Path-scoped auth only. A bare `router.use(requireScanAuth)` runs for every URL and sits before
+ * `telegramRouter` in `app.ts`, so it blocked `/telegram/*` (e.g. setup-webhooks).
+ */
+adminReceiptsRouter.use(
+  "/admin/receipt-submissions",
+  requireScanAuth,
+  requireStaffRole("organizer_admin")
+);
+adminReceiptsRouter.use("/admin/metrics", requireScanAuth, requireStaffRole("organizer_admin"));
 
 adminReceiptsRouter.get("/admin/receipt-submissions", async (req, res) => {
   const status = String(req.query.status ?? "verifying");

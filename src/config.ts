@@ -8,6 +8,16 @@ function required(name: string): string {
   return value;
 }
 
+/** Like `required` but trims — avoids webhook/setup 401s from accidental spaces in `.env`. */
+function requiredTrimmed(name: string): string {
+  const value = process.env[name];
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (!trimmed) {
+    throw new Error(`${name} is required.`);
+  }
+  return trimmed;
+}
+
 export const config = {
   port: Number(process.env.PORT ?? 4000),
   publicBaseUrl: process.env.PUBLIC_BASE_URL ?? "",
@@ -18,9 +28,9 @@ export const config = {
   telegramUserBotToken: process.env.TELEGRAM_USER_BOT_TOKEN ?? "",
   /** Public @username of the user ticket bot (no @). Used for `t.me/...?start=ORDER_REF` after web checkout. */
   telegramUserBotUsername: (process.env.TELEGRAM_USER_BOT_USERNAME ?? "").trim().replace(/^@/, ""),
-  telegramAdminWebhookSecret: required("TELEGRAM_ADMIN_WEBHOOK_SECRET"),
-  telegramUserWebhookSecret: required("TELEGRAM_USER_WEBHOOK_SECRET"),
-  telegramSetupSecret: required("TELEGRAM_SETUP_SECRET"),
+  telegramAdminWebhookSecret: requiredTrimmed("TELEGRAM_ADMIN_WEBHOOK_SECRET"),
+  telegramUserWebhookSecret: requiredTrimmed("TELEGRAM_USER_WEBHOOK_SECRET"),
+  telegramSetupSecret: requiredTrimmed("TELEGRAM_SETUP_SECRET"),
   adminTelegramIds: (process.env.ADMIN_TELEGRAM_IDS ?? "")
     .split(",")
     .map((item) => item.trim())

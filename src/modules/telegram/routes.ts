@@ -36,6 +36,13 @@ import { getEventTicketSalesReport } from "../events/salesReport";
 
 export const telegramRouter = express.Router();
 
+function incomingWebhookSecret(req: express.Request): string {
+  const raw = req.headers["x-telegram-bot-api-secret-token"];
+  if (raw == null) return "";
+  const first = Array.isArray(raw) ? raw[0] : raw;
+  return typeof first === "string" ? first.trim() : "";
+}
+
 let adminBot: Telegraf | null = null;
 let userBot: Telegraf | null = null;
 
@@ -2623,8 +2630,7 @@ telegramRouter.post("/telegram/admin/webhook", async (req, res) => {
     return;
   }
 
-  const secret = req.headers["x-telegram-bot-api-secret-token"];
-  if (secret !== config.telegramAdminWebhookSecret) {
+  if (incomingWebhookSecret(req) !== config.telegramAdminWebhookSecret) {
     res.status(401).json({ error: "Invalid webhook secret." });
     return;
   }
@@ -2644,8 +2650,7 @@ telegramRouter.post("/telegram/user/webhook", async (req, res) => {
     return;
   }
 
-  const secret = req.headers["x-telegram-bot-api-secret-token"];
-  if (secret !== config.telegramUserWebhookSecret) {
+  if (incomingWebhookSecret(req) !== config.telegramUserWebhookSecret) {
     res.status(401).json({ error: "Invalid webhook secret." });
     return;
   }
