@@ -947,7 +947,9 @@ if (config.telegramAdminBotToken) {
     await ctx.answerCbQuery();
     const eventId = ctx.match[1];
     await ctx.reply(
-      "Choose field to edit:",
+      "Choose an event field (name, dates, images, featured, status, etc.).\n\n" +
+        "Early-bird pricing is per ticket tier, not here: tap Done, then Edit vip / Edit standard → Early $ and Early end.\n\n" +
+        "Promo codes are not in Telegram yet — use HTTP POST /admin/promo-codes with header x-scanner-api-key.",
       Markup.inlineKeyboard([
         [
           Markup.button.callback("Name", telegramCallbackData(`e_f:${eventId}:n`)),
@@ -967,9 +969,32 @@ if (config.telegramAdminBotToken) {
         ],
         [Markup.button.callback("Ticket Template URL", telegramCallbackData(`e_f:${eventId}:m`))],
         [Markup.button.callback("Featured (list order)", telegramCallbackData(`e_f:${eventId}:f`))],
-        [Markup.button.callback("Done", telegramCallbackData(`edo:${eventId}`))]
+        [Markup.button.callback("Where are early-bird & promos?", telegramCallbackData(`e_pricing_help:${eventId}`))],
+        [Markup.button.callback("Done (back to event)", telegramCallbackData(`edo:${eventId}`))]
       ])
     );
+  });
+
+  adminBot.action(new RegExp(`^e_pricing_help:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    const eventId = ctx.match[1];
+    await ctx.reply(
+      [
+        "Early bird (per tier):",
+        "1) Open the event detail screen (Event List → event, or tap Done below).",
+        "2) Under Tiers, tap Edit {tierCode}.",
+        "3) Early $ (ETB), then Early end (ISO datetime, e.g. 2026-06-01T17:00:00Z). Type skip on either to clear.",
+        "",
+        "Promo codes:",
+        "Only via HTTP today: POST /admin/promo-codes with x-scanner-api-key and JSON body.",
+        "There is no Telegram promo menu yet."
+      ].join("\n")
+    );
+    await sendEventDetail(ctx.chat!.id, eventId);
   });
 
   adminBot.action(new RegExp(`^e_f:${CB_UUID}:([a-z])$`), async (ctx) => {
@@ -1037,7 +1062,7 @@ if (config.telegramAdminBotToken) {
     }
     await ctx.answerCbQuery();
     await ctx.reply(
-      "Commands:\n/adminmenu\n/newevent name|…|category(optional)|featured yes/no(optional)\nEvent List: category filter buttons — open an event to Publish / Close sales / Draft\nWhen an event becomes published, it can auto-post to your channel (set TELEGRAM_EVENTS_CHANNEL_CHAT_ID; user bot must be channel admin). From an event’s detail screen you can also tap “Post to channel again”.\n/addtier eventId|…\n/resendtickets ORDER_REF — resend all QR images to buyer (admin only)\n/verifyqueue\n/approve /reject /reverify /releasereceipt /eventsales …\nScanner staff: admin menu button — add/disable/enable gate logins, roles, scan counts & audit history."
+      "Commands:\n/adminmenu\n/newevent name|…|category(optional)|featured yes/no(optional)\nEvent List: category filter buttons — open an event to Publish / Close sales / Draft\nWhen an event becomes published, it can auto-post to your channel (set TELEGRAM_EVENTS_CHANNEL_CHAT_ID; user bot must be channel admin). From an event’s detail screen you can also tap “Post to channel again”.\n/addtier eventId|… (no early-bird — use Edit tier on the event screen for Early $ / Early end)\n/resendtickets ORDER_REF — resend all QR images to buyer (admin only)\n/verifyqueue\n/approve /reject /reverify /releasereceipt /eventsales …\nPromo codes: HTTP POST /admin/promo-codes (x-scanner-api-key), not in Telegram yet.\nScanner staff: admin menu button — add/disable/enable gate logins, roles, scan counts & audit history."
     );
   });
 
