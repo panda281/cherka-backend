@@ -33,6 +33,8 @@ import {
   announcePublishedEventToChannel,
   scheduleChannelAnnounceWhenNewlyPublished
 } from "./announceEventChannel";
+import { setEventSalesActive } from "../events/activation";
+import { setTierEarlyBirdEnabled } from "../events/earlyBirdActivation";
 import { getEventTicketSalesReport } from "../events/salesReport";
 import { createPromoBatch, deletePromoById, MAX_PROMOS_PER_REQUEST, updatePromoById } from "../promo/service";
 
@@ -120,6 +122,7 @@ function formatBrowseEventBlock(
     price: string;
     earlyBirdPrice: string | null;
     earlyBirdEndsAt: Date | null;
+    earlyBirdEnabled?: boolean;
   }[],
   at: Date = new Date()
 ): string {
@@ -140,6 +143,7 @@ function formatBrowseEventBlock(
             const reg = Number(tier.price);
             const code = `\`${escapeMarkdownV2InlineCode(tier.tierCode)}\``;
             const earlyOn =
+              tier.earlyBirdEnabled !== false &&
               tier.earlyBirdEndsAt != null &&
               tier.earlyBirdPrice != null &&
               at.getTime() < tier.earlyBirdEndsAt.getTime() &&
@@ -498,10 +502,15 @@ if (config.telegramAdminBotToken) {
           .map((tier) => {
             const sold = soldMap.get(tier.id) ?? 0;
             const eff = effectiveUnitPriceEtb(tier);
-            const eb =
-              tier.earlyBirdPrice != null && tier.earlyBirdEndsAt != null
-                ? ` early ${tier.earlyBirdPrice} until ${tier.earlyBirdEndsAt.toISOString().slice(0, 16)} →`
-                : "";
+            const hasEbConfig = tier.earlyBirdPrice != null && tier.earlyBirdEndsAt != null;
+            const ebEnabled = hasEbConfig && tier.earlyBirdEnabled !== false;
+            let eb = "";
+            if (hasEbConfig) {
+              const ends = tier.earlyBirdEndsAt!;
+              eb = !ebEnabled
+                ? ` early bird OFF (saved ${tier.earlyBirdPrice} until ${ends.toISOString().slice(0, 16)}) →`
+                : ` early ${tier.earlyBirdPrice} until ${ends.toISOString().slice(0, 16)} →`;
+            }
             return `- ${tier.tierName} (${tier.tierCode})${eb} list ETB ${tier.price} · now ETB ${eff.toFixed(2)} | sold ${sold} | ${tier.active ? "active" : "inactive"}`;
           })
           .join("\n")
@@ -516,15 +525,32 @@ if (config.telegramAdminBotToken) {
 
     const detailBody = `Event: ${eventItem.name}\nCategory: ${eventItem.category}\nFeatured: ${eventItem.featured ? "yes (shown first on lists)" : "no"}\nStatus: ${eventItem.status} — published = on sale (web + Telegram browse); closed/draft = disabled (no new orders, check-in still works)\nStart: ${eventItem.startsAt.toISOString()}\nEnd: ${eventItem.endsAt.toISOString()}\nLocation: ${eventItem.location ?? "-"}\nEvent image: ${eventItem.eventImageUrl ?? "-"}\nTicket template image: ${eventItem.ticketTemplateImageUrl ?? "-"}\n\nTiers:\n${tiersText}\n\nIssued tickets: ${issuedCount} — use the “Ticket holders” button below for the full list.`;
 
-    const tierButtons = tiers.flatMap((tier) => [
-      [
-        Markup.button.callback(`Edit ${tier.tierCode}`, telegramCallbackData(`t_edit:${tier.id}`)),
-        Markup.button.callback(
-          tier.active ? `Deactivate ${tier.tierCode}` : `Activate ${tier.tierCode}`,
-          telegramCallbackData(`t_tgl:${tier.id}`)
-        )
-      ]
-    ]);
+    const tierButtons = tiers.flatMap((tier) => {
+      const hasEbConfig = tier.earlyBirdPrice != null && tier.earlyBirdEndsAt != null;
+      const ebOn = hasEbConfig && tier.earlyBirdEnabled !== false;
+      return [
+        [
+          Markup.button.callback(`Edit ${tier.tierCode}`, telegramCallbackData(`t_edit:${tier.id}`)),
+          Markup.button.callback(
+            tier.active ? `Deactivate ${tier.tierCode}` : `Activate ${tier.tierCode}`,
+            telegramCallbackData(`t_tgl:${tier.id}`)
+          )
+        ],
+        hasEbConfig
+          ? [
+              Markup.button.callback(
+                ebOn ? `EB ON · ${tier.tierCode}` : `EB OFF · ${tier.tierCode}`,
+                telegramCallbackData(`t_eb:${tier.id}`)
+              )
+            ]
+          : [
+              Markup.button.callback(
+                `EB: set in Edit · ${tier.tierCode}`,
+                telegramCallbackData(`t_edit:${tier.id}`)
+              )
+            ]
+      ];
+    });
 
     await adminBot!.telegram.sendMessage(
       chatId,
@@ -931,21 +957,37 @@ if (config.telegramAdminBotToken) {
     }
     const eventId = ctx.match[1];
     const code = ctx.match[2];
-    const status = code === "pub" ? "published" : code === "clo" ? "closed" : "draft";
-    const prev = await db.query.events.findFirst({
-      where: eq(events.id, eventId),
-      columns: { status: true }
-    });
-    const [row] = await db.update(events).set({ status, updatedAt: new Date() }).where(eq(events.id, eventId)).returning();
+    if (code === "pub") {
+      const result = await setEventSalesActive(eventId, true);
+      if (!result.ok) {
+        await ctx.answerCbQuery("Event not found");
+        return;
+      }
+      await ctx.answerCbQuery("Sales on (published)");
+      await sendEventDetail(ctx.chat!.id, eventId);
+      return;
+    }
+    if (code === "clo") {
+      const result = await setEventSalesActive(eventId, false);
+      if (!result.ok) {
+        await ctx.answerCbQuery("Event not found");
+        return;
+      }
+      await ctx.answerCbQuery("Sales off (closed)");
+      await sendEventDetail(ctx.chat!.id, eventId);
+      return;
+    }
+    const [row] = await db
+      .update(events)
+      .set({ status: "draft", updatedAt: new Date() })
+      .where(eq(events.id, eventId))
+      .returning();
     if (!row) {
       await ctx.answerCbQuery("Event not found");
       return;
     }
-    await ctx.answerCbQuery(`Set to ${status}`);
+    await ctx.answerCbQuery("Set to draft");
     await sendEventDetail(ctx.chat!.id, eventId);
-    if (status === "published" && prev?.status !== "published") {
-      scheduleChannelAnnounceWhenNewlyPublished(eventId, prev?.status);
-    }
   });
 
   adminBot.action(new RegExp(`^e_pch:${CB_UUID}$`), async (ctx) => {
@@ -1013,6 +1055,40 @@ if (config.telegramAdminBotToken) {
       .where(eq(eventTiers.id, tier.id));
     await ctx.reply(`Tier ${tier.tierCode} is now ${tier.active ? "inactive" : "active"}.`);
     await sendEventDetail(ctx.chat!.id, eventId);
+  });
+
+  adminBot.action(new RegExp(`^t_eb:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    const tierId = ctx.match![1]!;
+    const tier = await db.query.eventTiers.findFirst({
+      where: eq(eventTiers.id, tierId)
+    });
+    if (!tier) {
+      await ctx.answerCbQuery("Not found");
+      await ctx.reply("Tier not found.");
+      return;
+    }
+    const hasEb = tier.earlyBirdPrice != null && tier.earlyBirdEndsAt != null;
+    if (!hasEb) {
+      await ctx.answerCbQuery("Configure in Edit tier");
+      await ctx.reply("Set Early $ and Early end on Edit tier first, then you can toggle EB on/off here.");
+      await sendEventDetail(ctx.chat!.id, tier.eventId);
+      return;
+    }
+    const currentlyOn = tier.earlyBirdEnabled !== false;
+    const result = await setTierEarlyBirdEnabled(tier.eventId, tierId, !currentlyOn);
+    if (!result.ok) {
+      await ctx.answerCbQuery("Could not update");
+      if (result.error === "early_bird_not_configured") {
+        await ctx.reply("Early bird price and end date must both be set before enabling.");
+      }
+      return;
+    }
+    await ctx.answerCbQuery(!currentlyOn ? "Early bird on" : "Early bird paused");
+    await sendEventDetail(ctx.chat!.id, tier.eventId);
   });
 
   adminBot.action(new RegExp(`^t_edit:${CB_UUID}$`), async (ctx) => {
@@ -1136,6 +1212,7 @@ if (config.telegramAdminBotToken) {
         "1) Open the event detail screen (Event List → event, or tap Done below).",
         "2) Under Tiers, tap Edit {tierCode}.",
         "3) Early $ (ETB), then Early end (ISO datetime, e.g. 2026-06-01T17:00:00Z). Type skip on either to clear.",
+        "4) On the event screen, use EB ON / EB OFF per tier to pause or resume early-bird pricing without deleting your settings.",
         "",
         "Promo codes:",
         "Admin menu → Promo codes — create batch, browse, edit, delete.",
@@ -1210,7 +1287,7 @@ if (config.telegramAdminBotToken) {
     }
     await ctx.answerCbQuery();
     await ctx.reply(
-      "Commands:\n/adminmenu\n/newevent name|…|category(optional)|featured yes/no(optional)\nEvent List: category filter buttons — open an event to Publish / Close sales / Draft\nWhen an event becomes published, it can auto-post to your channel (set TELEGRAM_EVENTS_CHANNEL_CHAT_ID; user bot must be channel admin). From an event’s detail screen you can also tap “Post to channel again”.\n/addtier eventId|… (no early-bird — use Edit tier on the event screen for Early $ / Early end)\n/resendtickets ORDER_REF — resend all QR images to buyer (admin only)\n/verifyqueue\n/approve /reject /reverify /releasereceipt /eventsales …\nPromo codes: admin menu → Promo codes (create/browse/edit/delete). Same rules as HTTP /admin/promo-codes for API clients.\nScanner staff: admin menu button — add/disable/enable gate logins, roles, scan counts & audit history."
+      "Commands:\n/adminmenu\n/newevent name|…|category(optional)|featured yes/no(optional)\nEvent List: category filter buttons — open an event to Publish / Close sales / Draft (same as HTTP POST /admin/events/:eventId/activation with {\"active\":true|false})\nPer tier: EB ON/OFF toggles early-bird pricing (HTTP POST …/tiers/:tierId/early-bird with {\"enabled\":true|false}); configure Early $ + end in Edit tier first.\nWhen an event becomes published, it can auto-post to your channel (set TELEGRAM_EVENTS_CHANNEL_CHAT_ID; user bot must be channel admin). From an event’s detail screen you can also tap “Post to channel again”.\n/addtier eventId|… (no early-bird — use Edit tier on the event screen for Early $ / Early end)\n/resendtickets ORDER_REF — resend all QR images to buyer (admin only)\n/verifyqueue\n/approve /reject /reverify /releasereceipt /eventsales …\nPromo codes: admin menu → Promo codes (create/browse/edit/delete). Same rules as HTTP /admin/promo-codes for API clients.\nScanner staff: admin menu button — add/disable/enable gate logins, roles, scan counts & audit history."
     );
   });
 

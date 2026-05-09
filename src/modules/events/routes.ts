@@ -6,6 +6,8 @@ import { db } from "../../db/client";
 import { eventTiers, events } from "../../db/schema";
 import { scheduleChannelAnnounceWhenNewlyPublished } from "../telegram/announceEventChannel";
 import { requireScanAuth, requireStaffRole } from "../scanner/scanAuth";
+import { setEventSalesActive } from "./activation";
+import { setTierEarlyBirdEnabled } from "./earlyBirdActivation";
 import { getEventLedgerRows, getEventTicketSalesReport, ledgerRowsToCsv } from "./salesReport";
 
 export const eventsRouter = express.Router();
@@ -91,6 +93,43 @@ eventsRouter.patch("/admin/events/:eventId", requireScanAuth, requireStaffRole("
   }
   res.json(row);
 });
+
+/** Body: `{ "active": true }` → published (on sale); `{ "active": false }` → closed (sales disabled). */
+eventsRouter.post("/admin/events/:eventId/activation", requireScanAuth, requireStaffRole("organizer_admin"), async (req, res) => {
+  const eventId = routeParamId(req.params.eventId);
+  const body = z.object({ active: z.boolean() }).parse(req.body);
+  const result = await setEventSalesActive(eventId, body.active);
+  if (!result.ok) {
+    res.status(404).json({ error: "Event not found" });
+    return;
+  }
+  res.json(result.row);
+});
+
+/** Body: `{ "enabled": true }` turns on early-bird pricing (requires early price + end date set); `{ "enabled": false }` pauses it without clearing saved values. */
+eventsRouter.post(
+  "/admin/events/:eventId/tiers/:tierId/early-bird",
+  requireScanAuth,
+  requireStaffRole("organizer_admin"),
+  async (req, res) => {
+    const eventId = routeParamId(req.params.eventId);
+    const tierId = routeParamId(req.params.tierId);
+    const body = z.object({ enabled: z.boolean() }).parse(req.body);
+    const result = await setTierEarlyBirdEnabled(eventId, tierId, body.enabled);
+    if (!result.ok) {
+      if (result.error === "tier_not_found") {
+        res.status(404).json({ error: "Tier not found" });
+        return;
+      }
+      res.status(400).json({
+        error: "Set earlyBirdPrice and earlyBirdEndsAt on the tier before enabling early bird.",
+        code: "early_bird_not_configured"
+      });
+      return;
+    }
+    res.json(result.row);
+  }
+);
 
 eventsRouter.post("/admin/events/:eventId/tiers", requireScanAuth, requireStaffRole("organizer_admin"), async (req, res) => {
   const data = createTierSchema.parse(req.body);

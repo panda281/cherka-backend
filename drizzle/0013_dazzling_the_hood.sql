@@ -1,0 +1,1 @@
+ALTER TABLE "event_tiers" ADD COLUMN "early_bird_enabled" boolean DEFAULT true NOT NULL;

@@ -74,9 +74,11 @@ export const eventTiers = pgTable(
     tierName: varchar("tier_name", { length: 100 }).notNull(),
     /** Regular / door price (after early bird window). */
     price: numeric("price", { precision: 12, scale: 2 }).notNull(),
-    /** Optional early-bird unit price; active while `earlyBirdEndsAt` is in the future. */
+    /** Optional early-bird unit price; active while `earlyBirdEndsAt` is in the future and `earlyBirdEnabled`. */
     earlyBirdPrice: numeric("early_bird_price", { precision: 12, scale: 2 }),
     earlyBirdEndsAt: timestamp("early_bird_ends_at", { withTimezone: true }),
+    /** When false, list/reg price applies even if early-bird $ and end date are set (pause without losing config). */
+    earlyBirdEnabled: boolean("early_bird_enabled").default(true).notNull(),
     capacity: integer("capacity"),
     active: boolean("active").default(true).notNull(),
     createdAt: now,
