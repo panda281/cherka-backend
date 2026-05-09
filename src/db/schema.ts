@@ -89,6 +89,8 @@ export const eventTiers = pgTable(
 
 export const promoCodes = pgTable("promo_codes", {
   id: uuid("id").defaultRandom().primaryKey(),
+  /** Human-readable label for this promo batch or campaign. */
+  name: varchar("name", { length: 200 }).notNull().default(""),
   /** Normalized lowercase in app; globally unique. */
   code: varchar("code", { length: 40 }).notNull().unique(),
   /** When set, code applies only to orders for this event. */

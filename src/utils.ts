@@ -5,6 +5,17 @@ export function buildOrderRef(): string {
   return `ORD-${Date.now().toString(36)}-${crypto.randomBytes(3).toString("hex")}`.toUpperCase();
 }
 
+/** Lowercase alphanumeric promo code (matches checkout normalization). */
+export function generatePromoCode(length = 8): string {
+  const alphabet = "abcdefghjkmnpqrstuvwxyz23456789";
+  const buf = crypto.randomBytes(length);
+  let s = "";
+  for (let i = 0; i < length; i++) {
+    s += alphabet[buf[i]! % alphabet.length]!;
+  }
+  return s;
+}
+
 export function buildReceiptUrl(receiptNo: string): string {
   return `https://transactioninfo.ethiotelecom.et/receipt/${encodeURIComponent(receiptNo)}`;
 }

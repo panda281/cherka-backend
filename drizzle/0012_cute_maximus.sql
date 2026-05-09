@@ -1,0 +1,1 @@
+ALTER TABLE "promo_codes" ADD COLUMN "name" varchar(200) DEFAULT '' NOT NULL;

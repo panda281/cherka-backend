@@ -85,6 +85,13 @@
       "when": 1777760656133,
       "tag": "0011_scanner_staff_audit_checkins",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1778343780869,
+      "tag": "0012_cute_maximus",
+      "breakpoints": true
     }
   ]
 }

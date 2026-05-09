@@ -2,11 +2,13 @@ import express from "express";
 import { desc, eq, isNull, or } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "../../db/client";
-import { events, promoCodes } from "../../db/schema";
+import { promoCodes } from "../../db/schema";
+import { createPromoBatch, MAX_PROMOS_PER_REQUEST, updatePromoById } from "./service";
 import { requireScanAuth, requireStaffRole } from "../scanner/scanAuth";
 
 const createPromoSchema = z.object({
-  code: z.string().min(2).max(40),
+  promoName: z.string().min(1).max(200),
+  count: z.coerce.number().int().min(1).max(MAX_PROMOS_PER_REQUEST),
   eventId: z.string().uuid().optional().nullable(),
   discountType: z.enum(["percent", "fixed_total"]),
   discountValue: z.coerce.number().positive(),
@@ -16,6 +18,19 @@ const createPromoSchema = z.object({
   active: z.boolean().optional()
 });
 
+const patchPromoSchema = z
+  .object({
+    promoName: z.string().min(1).max(200).optional(),
+    eventId: z.string().uuid().nullable().optional(),
+    discountType: z.enum(["percent", "fixed_total"]).optional(),
+    discountValue: z.coerce.number().positive().optional(),
+    maxUses: z.coerce.number().int().positive().nullable().optional(),
+    validFrom: z.string().min(1).nullable().optional(),
+    validUntil: z.string().min(1).nullable().optional(),
+    active: z.boolean().optional()
+  })
+  .refine((body) => Object.keys(body).length > 0, { message: "At least one field is required." });
+
 export const promoAdminRouter = express.Router();
 
 promoAdminRouter.post(
@@ -24,41 +39,54 @@ promoAdminRouter.post(
   requireStaffRole("organizer_admin"),
   async (req, res) => {
     const body = createPromoSchema.parse(req.body);
-    const normalized = body.code.trim().toLowerCase();
-    if (body.discountType === "percent" && body.discountValue > 100) {
-      res.status(400).json({ error: "Percent discount cannot exceed 100." });
+    const result = await createPromoBatch({
+      promoName: body.promoName,
+      count: body.count,
+      eventId: body.eventId,
+      discountType: body.discountType,
+      discountValue: body.discountValue,
+      maxUses: body.maxUses,
+      validFrom: body.validFrom,
+      validUntil: body.validUntil,
+      active: body.active
+    });
+
+    if (!result.ok) {
+      const status =
+        result.code === "event" ? 404 : result.code === "validation" ? 400 : result.code === "alloc" ? 503 : 409;
+      res.status(status).json({ error: result.error });
       return;
     }
-    if (body.eventId) {
-      const ev = await db.query.events.findFirst({ where: eq(events.id, body.eventId) });
-      if (!ev) {
-        res.status(404).json({ error: "Event not found." });
-        return;
-      }
+
+    res.status(201).json({ rows: result.rows, count: result.rows.length });
+  }
+);
+
+promoAdminRouter.patch(
+  "/admin/promo-codes/:promoId",
+  requireScanAuth,
+  requireStaffRole("organizer_admin"),
+  async (req, res) => {
+    const promoId = z.string().uuid().parse(req.params.promoId);
+    const body = patchPromoSchema.parse(req.body);
+
+    const result = await updatePromoById(promoId, {
+      promoName: body.promoName,
+      eventId: body.eventId,
+      discountType: body.discountType,
+      discountValue: body.discountValue,
+      maxUses: body.maxUses,
+      validFrom: body.validFrom,
+      validUntil: body.validUntil,
+      active: body.active
+    });
+
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
     }
-    try {
-      const [row] = await db
-        .insert(promoCodes)
-        .values({
-          code: normalized,
-          eventId: body.eventId ?? undefined,
-          discountType: body.discountType,
-          discountValue: body.discountValue.toFixed(2),
-          maxUses: body.maxUses ?? undefined,
-          validFrom: body.validFrom ? new Date(body.validFrom) : undefined,
-          validUntil: body.validUntil ? new Date(body.validUntil) : undefined,
-          active: body.active ?? true
-        })
-        .returning();
-      res.status(201).json(row);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (msg.includes("unique") || msg.includes("duplicate")) {
-        res.status(409).json({ error: "A promo with this code already exists." });
-        return;
-      }
-      throw e;
-    }
+
+    res.json({ row: result.row });
   }
 );
 

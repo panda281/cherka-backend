@@ -12,6 +12,7 @@ import {
   events,
   orders,
   privacyAcceptances,
+  promoCodes,
   receiptSubmissions,
   scannerUsers,
   tickets
@@ -33,6 +34,7 @@ import {
   scheduleChannelAnnounceWhenNewlyPublished
 } from "./announceEventChannel";
 import { getEventTicketSalesReport } from "../events/salesReport";
+import { createPromoBatch, deletePromoById, MAX_PROMOS_PER_REQUEST, updatePromoById } from "../promo/service";
 
 export const telegramRouter = express.Router();
 
@@ -438,6 +440,34 @@ type AdminScannerUserAddState = {
 };
 const adminScannerUserAddState = new Map<string, AdminScannerUserAddState>();
 
+type AdminPromoCreateState = {
+  step:
+    | "name"
+    | "count"
+    | "event"
+    | "dtype"
+    | "dvalue"
+    | "maxUses"
+    | "validFrom"
+    | "validUntil";
+  discountType?: "percent" | "fixed_total";
+  name?: string;
+  count?: number;
+  eventId?: string | null;
+  discountValue?: number;
+  maxUses?: number | null;
+  validFrom?: string | null;
+  validUntil?: string | null;
+};
+
+type AdminPromoEditState = {
+  promoId: string;
+  field: "name" | "discount" | "maxUses" | "event" | "validFrom" | "validUntil";
+};
+
+const adminPromoCreateState = new Map<string, AdminPromoCreateState>();
+const adminPromoEditState = new Map<string, AdminPromoEditState>();
+
 if (config.telegramAdminBotToken) {
   adminBot = new Telegraf(config.telegramAdminBotToken);
 
@@ -713,9 +743,127 @@ if (config.telegramAdminBotToken) {
     );
   }
 
+  function parseEventIdOrGlobalForPromo(text: string): { ok: true; eventId: string | null } | { ok: false } {
+    const raw = text.trim();
+    const t = raw.toLowerCase();
+    if (t === "global" || t === "all" || t === "-" || t === "none") return { ok: true, eventId: null };
+    if (RECEIPT_UUID_RE.test(raw)) return { ok: true, eventId: raw };
+    return { ok: false };
+  }
+
+  async function sendPromoList(chatId: number): Promise<void> {
+    const rows = await db.query.promoCodes.findMany({
+      orderBy: [desc(promoCodes.createdAt)],
+      limit: 25
+    });
+    if (!rows.length) {
+      await adminBot!.telegram.sendMessage(
+        chatId,
+        "No promo codes yet. Tap Create batch.",
+        Markup.inlineKeyboard([
+          [Markup.button.callback("Create batch", telegramCallbackData("pm_cr"))],
+          [Markup.button.callback("Back to menu", telegramCallbackData("adm"))]
+        ])
+      );
+      return;
+    }
+    const eventIds = [...new Set(rows.map((r) => r.eventId).filter(Boolean))] as string[];
+    const evRows =
+      eventIds.length > 0
+        ? await db.query.events.findMany({
+            where: inArray(events.id, eventIds),
+            columns: { id: true, name: true }
+          })
+        : [];
+    const evMap = new Map(evRows.map((e) => [e.id, e.name]));
+    const lines = rows.map((r) => {
+      const ev = r.eventId ? (evMap.get(r.eventId) ?? `${r.eventId.slice(0, 8)}…`) : "global";
+      const disc = r.discountType === "percent" ? `${r.discountValue}%` : `−${r.discountValue} ETB`;
+      const use = r.maxUses != null ? `${r.usesCount}/${r.maxUses}` : `${r.usesCount}/∞`;
+      const act = r.active ? "on" : "off";
+      return `${r.code} · ${disc} · uses ${use} · ${act}\n${ev} · ${r.name.slice(0, 48)}`;
+    });
+    const buttons = rows.map((r) => [
+      Markup.button.callback(
+        `${r.active ? "" : "○ "}${r.code}`.slice(0, 58),
+        telegramCallbackData(`pm_v:${r.id}`)
+      )
+    ]);
+    await adminBot!.telegram.sendMessage(
+      chatId,
+      `Recent promos (up to 25):\n\n${lines.join("\n\n")}`,
+      Markup.inlineKeyboard([
+        ...buttons,
+        [
+          Markup.button.callback("Create batch", telegramCallbackData("pm_cr")),
+          Markup.button.callback("Back to menu", telegramCallbackData("adm"))
+        ]
+      ])
+    );
+  }
+
+  async function sendPromoDetail(chatId: number, promoId: string): Promise<void> {
+    const r = await db.query.promoCodes.findFirst({
+      where: eq(promoCodes.id, promoId)
+    });
+    if (!r) {
+      await adminBot!.telegram.sendMessage(chatId, "Promo not found.");
+      return;
+    }
+    let evLabel = "All events (global)";
+    if (r.eventId) {
+      const ev = await db.query.events.findFirst({
+        where: eq(events.id, r.eventId),
+        columns: { name: true }
+      });
+      evLabel = ev ? `${ev.name}` : r.eventId;
+    }
+    const disc =
+      r.discountType === "percent" ? `${r.discountValue}% off` : `ETB ${r.discountValue} off order`;
+    const use = r.maxUses != null ? `${r.usesCount} / ${r.maxUses}` : `${r.usesCount} / ∞`;
+    const vf = r.validFrom ? r.validFrom.toISOString() : "—";
+    const vu = r.validUntil ? r.validUntil.toISOString() : "—";
+    const body = [
+      `Promo: ${r.name}`,
+      `Code: ${r.code}`,
+      `Discount: ${disc}`,
+      `Event: ${evLabel}`,
+      `Uses: ${use}`,
+      `Active: ${r.active ? "yes" : "no"}`,
+      `Valid from: ${vf}`,
+      `Valid until: ${vu}`,
+      "",
+      `id: ${r.id}`
+    ].join("\n");
+    await adminBot!.telegram.sendMessage(
+      chatId,
+      body,
+      Markup.inlineKeyboard([
+        [Markup.button.callback(r.active ? "Deactivate" : "Activate", telegramCallbackData(`pm_a:${r.id}`))],
+        [
+          Markup.button.callback("Rename", telegramCallbackData(`pm_en:${r.id}`)),
+          Markup.button.callback("Discount", telegramCallbackData(`pm_ed:${r.id}`))
+        ],
+        [
+          Markup.button.callback("Max uses", telegramCallbackData(`pm_mu:${r.id}`)),
+          Markup.button.callback("Event scope", telegramCallbackData(`pm_ev:${r.id}`))
+        ],
+        [
+          Markup.button.callback("Valid from", telegramCallbackData(`pm_vf:${r.id}`)),
+          Markup.button.callback("Valid until", telegramCallbackData(`pm_vu:${r.id}`))
+        ],
+        [
+          Markup.button.callback("Delete", telegramCallbackData(`pm_dl:${r.id}`)),
+          Markup.button.callback("Browse list", telegramCallbackData("pm_ls"))
+        ]
+      ])
+    );
+  }
+
   const adminMenu = Markup.inlineKeyboard([
     [Markup.button.callback("Create New Event", telegramCallbackData("nw"))],
     [Markup.button.callback("Event List", telegramCallbackData("lst"))],
+    [Markup.button.callback("Promo codes", telegramCallbackData("pm_m"))],
     [Markup.button.callback("Scanner staff", telegramCallbackData("su_l"))],
     [Markup.button.callback("View Verify Queue", telegramCallbackData("vq"))],
     [Markup.button.callback("Show Commands", telegramCallbackData("cmd"))]
@@ -949,7 +1097,7 @@ if (config.telegramAdminBotToken) {
     await ctx.reply(
       "Choose an event field (name, dates, images, featured, status, etc.).\n\n" +
         "Early-bird pricing is per ticket tier, not here: tap Done, then Edit vip / Edit standard → Early $ and Early end.\n\n" +
-        "Promo codes are not in Telegram yet — use HTTP POST /admin/promo-codes with header x-scanner-api-key.",
+        "Promo codes: Admin menu → Promo codes (or HTTP /admin/promo-codes with x-scanner-api-key).",
       Markup.inlineKeyboard([
         [
           Markup.button.callback("Name", telegramCallbackData(`e_f:${eventId}:n`)),
@@ -990,8 +1138,8 @@ if (config.telegramAdminBotToken) {
         "3) Early $ (ETB), then Early end (ISO datetime, e.g. 2026-06-01T17:00:00Z). Type skip on either to clear.",
         "",
         "Promo codes:",
-        "Only via HTTP today: POST /admin/promo-codes with x-scanner-api-key and JSON body.",
-        "There is no Telegram promo menu yet."
+        "Admin menu → Promo codes — create batch, browse, edit, delete.",
+        "HTTP still works: POST/PATCH /admin/promo-codes with x-scanner-api-key."
       ].join("\n")
     );
     await sendEventDetail(ctx.chat!.id, eventId);
@@ -1062,8 +1210,193 @@ if (config.telegramAdminBotToken) {
     }
     await ctx.answerCbQuery();
     await ctx.reply(
-      "Commands:\n/adminmenu\n/newevent name|…|category(optional)|featured yes/no(optional)\nEvent List: category filter buttons — open an event to Publish / Close sales / Draft\nWhen an event becomes published, it can auto-post to your channel (set TELEGRAM_EVENTS_CHANNEL_CHAT_ID; user bot must be channel admin). From an event’s detail screen you can also tap “Post to channel again”.\n/addtier eventId|… (no early-bird — use Edit tier on the event screen for Early $ / Early end)\n/resendtickets ORDER_REF — resend all QR images to buyer (admin only)\n/verifyqueue\n/approve /reject /reverify /releasereceipt /eventsales …\nPromo codes: HTTP POST /admin/promo-codes (x-scanner-api-key), not in Telegram yet.\nScanner staff: admin menu button — add/disable/enable gate logins, roles, scan counts & audit history."
+      "Commands:\n/adminmenu\n/newevent name|…|category(optional)|featured yes/no(optional)\nEvent List: category filter buttons — open an event to Publish / Close sales / Draft\nWhen an event becomes published, it can auto-post to your channel (set TELEGRAM_EVENTS_CHANNEL_CHAT_ID; user bot must be channel admin). From an event’s detail screen you can also tap “Post to channel again”.\n/addtier eventId|… (no early-bird — use Edit tier on the event screen for Early $ / Early end)\n/resendtickets ORDER_REF — resend all QR images to buyer (admin only)\n/verifyqueue\n/approve /reject /reverify /releasereceipt /eventsales …\nPromo codes: admin menu → Promo codes (create/browse/edit/delete). Same rules as HTTP /admin/promo-codes for API clients.\nScanner staff: admin menu button — add/disable/enable gate logins, roles, scan counts & audit history."
     );
+  });
+
+  adminBot.action("pm_m", async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    await ctx.reply(
+      "Promo codes — server generates each code string; you set name, count, discount, and optional limits.",
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Create batch", telegramCallbackData("pm_cr"))],
+        [Markup.button.callback("Browse recent", telegramCallbackData("pm_ls"))],
+        [Markup.button.callback("Back to menu", telegramCallbackData("adm"))]
+      ])
+    );
+  });
+
+  adminBot.action("pm_ls", async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    await sendPromoList(ctx.chat!.id);
+  });
+
+  adminBot.action("pm_cr", async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    adminPromoCreateState.set(String(ctx.from.id), { step: "name" });
+    await ctx.reply(
+      "Create promo batch.\nStep 1: send campaign name (stored on each generated code).\n/cancel to abort."
+    );
+  });
+
+  adminBot.action(/^pm_ct:([pf])$/, async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    const st = adminPromoCreateState.get(String(ctx.from.id));
+    if (!st || st.step !== "dtype") {
+      await ctx.answerCbQuery("No draft here");
+      return;
+    }
+    const code = ctx.match![1];
+    st.discountType = code === "p" ? "percent" : "fixed_total";
+    st.step = "dvalue";
+    await ctx.answerCbQuery();
+    await ctx.reply(
+      st.discountType === "percent"
+        ? "Send percent discount (1–100)."
+        : "Send fixed discount in ETB (subtracted from order subtotal, capped at subtotal)."
+    );
+  });
+
+  adminBot.action(new RegExp(`^pm_v:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    await sendPromoDetail(ctx.chat!.id, ctx.match![1]!);
+  });
+
+  adminBot.action(new RegExp(`^pm_a:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    const id = ctx.match![1]!;
+    const row = await db.query.promoCodes.findFirst({ where: eq(promoCodes.id, id) });
+    if (!row) {
+      await ctx.answerCbQuery("Not found");
+      return;
+    }
+    const result = await updatePromoById(id, { active: !row.active });
+    await ctx.answerCbQuery(result.ok ? "Updated" : "Error");
+    if (result.ok) {
+      await sendPromoDetail(ctx.chat!.id, id);
+    } else {
+      await ctx.reply(result.error);
+    }
+  });
+
+  adminBot.action(new RegExp(`^pm_en:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    const id = ctx.match![1]!;
+    adminPromoEditState.set(String(ctx.from.id), { promoId: id, field: "name" });
+    await ctx.reply("Send new campaign name for this code.");
+  });
+
+  adminBot.action(new RegExp(`^pm_ed:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    const id = ctx.match![1]!;
+    adminPromoEditState.set(String(ctx.from.id), { promoId: id, field: "discount" });
+    await ctx.reply("Send discount as one line:\npercent 15\nor\nfixed 99.5\n(percent = % off subtotal; fixed = ETB off whole order subtotal).");
+  });
+
+  adminBot.action(new RegExp(`^pm_mu:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    const id = ctx.match![1]!;
+    adminPromoEditState.set(String(ctx.from.id), { promoId: id, field: "maxUses" });
+    await ctx.reply("Send max uses (positive integer), or unlimited");
+  });
+
+  adminBot.action(new RegExp(`^pm_ev:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    const id = ctx.match![1]!;
+    adminPromoEditState.set(String(ctx.from.id), { promoId: id, field: "event" });
+    await ctx.reply("Send event UUID to restrict this code to one event, or global");
+  });
+
+  adminBot.action(new RegExp(`^pm_vf:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    const id = ctx.match![1]!;
+    adminPromoEditState.set(String(ctx.from.id), { promoId: id, field: "validFrom" });
+    await ctx.reply("Send valid-from as ISO datetime, or skip");
+  });
+
+  adminBot.action(new RegExp(`^pm_vu:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    const id = ctx.match![1]!;
+    adminPromoEditState.set(String(ctx.from.id), { promoId: id, field: "validUntil" });
+    await ctx.reply("Send valid-until as ISO datetime, or skip");
+  });
+
+  adminBot.action(new RegExp(`^pm_dl:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    await ctx.answerCbQuery();
+    const id = ctx.match![1]!;
+    await ctx.reply(
+      "Delete this promo row permanently?",
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Yes, delete", telegramCallbackData(`pm_dy:${id}`))],
+        [Markup.button.callback("No", telegramCallbackData(`pm_v:${id}`))]
+      ])
+    );
+  });
+
+  adminBot.action(new RegExp(`^pm_dy:${CB_UUID}$`), async (ctx) => {
+    if (!isAdminUser(String(ctx.from.id))) {
+      await ctx.answerCbQuery("Unauthorized");
+      return;
+    }
+    const id = ctx.match![1]!;
+    const ok = await deletePromoById(id);
+    await ctx.answerCbQuery(ok ? "Deleted" : "Not found");
+    if (ok) {
+      await ctx.reply("Promo removed.");
+      await sendPromoList(ctx.chat!.id);
+    } else {
+      await ctx.reply("Promo not found (already deleted?).");
+    }
   });
 
   adminBot.action("adm", async (ctx) => {
@@ -1356,6 +1689,8 @@ if (config.telegramAdminBotToken) {
     adminEditState.delete(String(ctx.from.id));
     adminTierEditState.delete(String(ctx.from.id));
     adminScannerUserAddState.delete(String(ctx.from.id));
+    adminPromoCreateState.delete(String(ctx.from.id));
+    adminPromoEditState.delete(String(ctx.from.id));
     await ctx.reply("Current wizard cancelled.");
   });
 
@@ -1660,6 +1995,264 @@ if (config.telegramAdminBotToken) {
         return;
       }
     }
+
+    const promoEdit = adminPromoEditState.get(String(ctx.from.id));
+    if (promoEdit) {
+      const textRaw = getText(ctx).trim();
+      if (!textRaw) {
+        await ctx.reply("Send a value or /cancel.");
+        return;
+      }
+      const id = promoEdit.promoId;
+      if (promoEdit.field === "name") {
+        const result = await updatePromoById(id, { promoName: textRaw });
+        adminPromoEditState.delete(String(ctx.from.id));
+        if (!result.ok) {
+          await ctx.reply(result.error);
+          return;
+        }
+        await ctx.reply("Name updated.");
+        await sendPromoDetail(ctx.chat!.id, id);
+        return;
+      }
+      if (promoEdit.field === "discount") {
+        const pt = /^percent\s+(\d+(?:\.\d+)?)$/i.exec(textRaw);
+        const ft = /^fixed\s+(\d+(?:\.\d+)?)$/i.exec(textRaw);
+        if (!pt && !ft) {
+          await ctx.reply("Use exactly one line, e.g.\npercent 15\nor\nfixed 99.5");
+          return;
+        }
+        const discountType = pt ? "percent" : "fixed_total";
+        const discountValue = Number(pt ? pt[1] : ft![1]);
+        if (discountType === "percent" && (discountValue > 100 || discountValue <= 0)) {
+          await ctx.reply("Percent must be between 1 and 100.");
+          return;
+        }
+        if (discountType === "fixed_total" && discountValue <= 0) {
+          await ctx.reply("Fixed amount must be positive.");
+          return;
+        }
+        const result = await updatePromoById(id, { discountType, discountValue });
+        adminPromoEditState.delete(String(ctx.from.id));
+        if (!result.ok) {
+          await ctx.reply(result.error);
+          return;
+        }
+        await ctx.reply("Discount updated.");
+        await sendPromoDetail(ctx.chat!.id, id);
+        return;
+      }
+      if (promoEdit.field === "maxUses") {
+        const tl = textRaw.toLowerCase();
+        let maxUses: number | null;
+        if (tl === "unlimited" || tl === "none" || tl === "skip") {
+          maxUses = null;
+        } else {
+          const n = Number.parseInt(textRaw, 10);
+          if (Number.isNaN(n) || n < 1) {
+            await ctx.reply("Send a positive integer or unlimited.");
+            return;
+          }
+          maxUses = n;
+        }
+        const result = await updatePromoById(id, { maxUses });
+        adminPromoEditState.delete(String(ctx.from.id));
+        if (!result.ok) {
+          await ctx.reply(result.error);
+          return;
+        }
+        await ctx.reply("Max uses updated.");
+        await sendPromoDetail(ctx.chat!.id, id);
+        return;
+      }
+      if (promoEdit.field === "event") {
+        const parsed = parseEventIdOrGlobalForPromo(textRaw);
+        if (!parsed.ok) {
+          await ctx.reply("Send global or a valid event UUID.");
+          return;
+        }
+        if (parsed.eventId) {
+          const ev = await db.query.events.findFirst({ where: eq(events.id, parsed.eventId) });
+          if (!ev) {
+            await ctx.reply("Event not found.");
+            return;
+          }
+        }
+        const result = await updatePromoById(id, { eventId: parsed.eventId });
+        adminPromoEditState.delete(String(ctx.from.id));
+        if (!result.ok) {
+          await ctx.reply(result.error);
+          return;
+        }
+        await ctx.reply("Event scope updated.");
+        await sendPromoDetail(ctx.chat!.id, id);
+        return;
+      }
+      const tl = textRaw.toLowerCase();
+      let iso: string | null;
+      if (tl === "skip" || tl === "none" || tl === "-") {
+        iso = null;
+      } else if (Number.isNaN(Date.parse(textRaw))) {
+        await ctx.reply("Invalid date. Send ISO datetime or skip.");
+        return;
+      } else {
+        iso = textRaw;
+      }
+      const patch =
+        promoEdit.field === "validFrom"
+          ? ({ validFrom: iso } as const)
+          : ({ validUntil: iso } as const);
+      const result = await updatePromoById(id, patch);
+      adminPromoEditState.delete(String(ctx.from.id));
+      if (!result.ok) {
+        await ctx.reply(result.error);
+        return;
+      }
+      await ctx.reply("Saved.");
+      await sendPromoDetail(ctx.chat!.id, id);
+      return;
+    }
+
+    const promoCreate = adminPromoCreateState.get(String(ctx.from.id));
+    if (promoCreate) {
+      if (promoCreate.step === "dtype") {
+        await ctx.reply("Tap Percent or Fixed on the keyboard above.");
+        return;
+      }
+      const text = getText(ctx).trim();
+      if (!text) {
+        await ctx.reply("Send a value or /cancel.");
+        return;
+      }
+      if (promoCreate.step === "name") {
+        promoCreate.name = text.slice(0, 200);
+        promoCreate.step = "count";
+        await ctx.reply(`Step 2: how many codes? (1–${MAX_PROMOS_PER_REQUEST})`);
+        return;
+      }
+      if (promoCreate.step === "count") {
+        const n = Number.parseInt(text, 10);
+        if (Number.isNaN(n) || n < 1 || n > MAX_PROMOS_PER_REQUEST) {
+          await ctx.reply(`Send an integer from 1 to ${MAX_PROMOS_PER_REQUEST}.`);
+          return;
+        }
+        promoCreate.count = n;
+        promoCreate.step = "event";
+        await ctx.reply("Step 3: scope — send event UUID, or global");
+        return;
+      }
+      if (promoCreate.step === "event") {
+        const parsed = parseEventIdOrGlobalForPromo(text);
+        if (!parsed.ok) {
+          await ctx.reply("Send global or a valid event UUID.");
+          return;
+        }
+        if (parsed.eventId) {
+          const ev = await db.query.events.findFirst({ where: eq(events.id, parsed.eventId) });
+          if (!ev) {
+            await ctx.reply("Event not found.");
+            return;
+          }
+        }
+        promoCreate.eventId = parsed.eventId;
+        promoCreate.step = "dtype";
+        await ctx.reply(
+          "Step 4: discount type.",
+          Markup.inlineKeyboard([
+            [
+              Markup.button.callback("Percent off", telegramCallbackData("pm_ct:p")),
+              Markup.button.callback("Fixed ETB off order", telegramCallbackData("pm_ct:f"))
+            ]
+          ])
+        );
+        return;
+      }
+      if (promoCreate.step === "dvalue") {
+        const dv = Number(text);
+        if (!Number.isFinite(dv) || dv <= 0) {
+          await ctx.reply("Send a positive number.");
+          return;
+        }
+        if (promoCreate.discountType === "percent" && dv > 100) {
+          await ctx.reply("Percent cannot exceed 100.");
+          return;
+        }
+        promoCreate.discountValue = dv;
+        promoCreate.step = "maxUses";
+        await ctx.reply("Step 5: max uses per code — integer, or unlimited");
+        return;
+      }
+      if (promoCreate.step === "maxUses") {
+        const tl = text.toLowerCase();
+        if (tl === "unlimited" || tl === "none" || tl === "skip") {
+          promoCreate.maxUses = null;
+        } else {
+          const n = Number.parseInt(text, 10);
+          if (Number.isNaN(n) || n < 1) {
+            await ctx.reply("Send a positive integer or unlimited.");
+            return;
+          }
+          promoCreate.maxUses = n;
+        }
+        promoCreate.step = "validFrom";
+        await ctx.reply("Step 6: valid from — ISO datetime, or skip");
+        return;
+      }
+      if (promoCreate.step === "validFrom") {
+        const tl = text.toLowerCase();
+        if (tl === "skip" || tl === "none" || tl === "-") {
+          promoCreate.validFrom = null;
+        } else if (Number.isNaN(Date.parse(text))) {
+          await ctx.reply("Invalid date. ISO datetime or skip.");
+          return;
+        } else {
+          promoCreate.validFrom = text;
+        }
+        promoCreate.step = "validUntil";
+        await ctx.reply("Step 7: valid until — ISO datetime, or skip");
+        return;
+      }
+      if (promoCreate.step === "validUntil") {
+        const tl = text.toLowerCase();
+        if (tl === "skip" || tl === "none" || tl === "-") {
+          promoCreate.validUntil = null;
+        } else if (Number.isNaN(Date.parse(text))) {
+          await ctx.reply("Invalid date. ISO datetime or skip.");
+          return;
+        } else {
+          promoCreate.validUntil = text;
+        }
+        const uid = String(ctx.from.id);
+        const result = await createPromoBatch({
+          promoName: promoCreate.name!,
+          count: promoCreate.count!,
+          eventId: promoCreate.eventId,
+          discountType: promoCreate.discountType!,
+          discountValue: promoCreate.discountValue!,
+          maxUses: promoCreate.maxUses,
+          validFrom: promoCreate.validFrom,
+          validUntil: promoCreate.validUntil,
+          active: true
+        });
+        adminPromoCreateState.delete(uid);
+        if (!result.ok) {
+          await ctx.reply(`Could not create: ${result.error}`);
+          return;
+        }
+        const codesPreview = result.rows
+          .slice(0, 12)
+          .map((r) => r.code)
+          .join(", ");
+        const more = result.rows.length > 12 ? `\n… and ${result.rows.length - 12} more.` : "";
+        await ctx.reply(
+          `Created ${result.rows.length} code(s).\n${codesPreview}${more}\n\nAdmin menu → Promo codes → Browse recent for the list.`
+        );
+        return;
+      }
+      await ctx.reply("Unknown step. /cancel");
+      return;
+    }
+
     const state = adminCreateState.get(String(ctx.from.id));
     const tierState = adminTierAddState.get(String(ctx.from.id));
     const editState = adminEditState.get(String(ctx.from.id));
